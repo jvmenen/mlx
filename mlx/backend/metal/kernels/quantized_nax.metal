@@ -86,6 +86,14 @@
   instantiate_gather_qmm_rhs(affine_gather_qmm_rhs_nax, affine_gather_qmm_rhs_nax_nt, type, group_size, bits, 32, 64, 64, 2, 2, true) \
   instantiate_gather_qmm_rhs(affine_gather_qmm_rhs_nax, affine_gather_qmm_rhs_nax_nn, type, group_size, bits, 32, 64, 64, 2, 2, false)
 
+// Large-M tile (BM=128, BN=64, BK=128) for 16-bit activations; fp32 does not
+// fit the threadgroup memory limit with this tile.
+#define instantiate_quantized_large_m(type, group_size, bits) \
+  instantiate_quantized_aligned_batched(affine_qmm_t_nax, type, group_size, bits, 128, 64, 128, 2, 2, true, 1) \
+  instantiate_quantized_aligned_batched(affine_qmm_t_nax, type, group_size, bits, 128, 64, 128, 2, 2, true, 0) \
+  instantiate_quantized_aligned_batched(affine_qmm_t_nax, type, group_size, bits, 128, 64, 128, 2, 2, false, 1) \
+  instantiate_quantized_aligned_batched(affine_qmm_t_nax, type, group_size, bits, 128, 64, 128, 2, 2, false, 0)
+
 #define instantiate_quantized_funcs(type, group_size, bits) \
   instantiate_quantized_all_batched(type, group_size, bits) \
   instantiate_quantized_all_aligned(type, group_size, bits) \
@@ -94,7 +102,9 @@
 #define instantiate_quantized_types(group_size, bits)       \
   instantiate_quantized_funcs(float, group_size, bits)      \
   instantiate_quantized_funcs(float16_t, group_size, bits)  \
-  instantiate_quantized_funcs(bfloat16_t, group_size, bits)  
+  instantiate_quantized_funcs(bfloat16_t, group_size, bits) \
+  instantiate_quantized_large_m(float16_t, group_size, bits) \
+  instantiate_quantized_large_m(bfloat16_t, group_size, bits)
 
 #define instantiate_quantized_groups(bits) \
   instantiate_quantized_types(128, bits)   \
