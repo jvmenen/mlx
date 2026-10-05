@@ -406,6 +406,84 @@ class TestFastSDPA(mlx_tests.MLXTestCase):
             )
             self.assertTrue(mx.allclose(ref, out, atol=1e-3, rtol=1e-3))
 
+    @unittest.skipIf(not mx.is_available(mx.gpu), "GPU kernel path only")
+    def test_sdpa_full_head_dim_256_short_query(self):
+        # Causal 16-bit head dim 256 attention with at least 64 query rows
+        # (one query block of the NAX kernel) takes the fused kernel on NAX
+        # devices, including a short chunk appended to a long cached prefix.
+        # Fewer rows and float32 keep the unfused path. K/V are also sliced
+        # out of a longer preallocated cache, with large finite stale rows
+        # behind the slice.
+        D = 256
+        Nq, Nkv = 8, 2
+        scale = D**-0.5
+        mx.random.seed(0)
+        cases = [
+            # (qL, kL, cache_len)
+            (64, 64, None),
+            (64, 4096, None),
+            (65, 4097, 4224),
+            (129, 8192, None),
+            (512, 512, None),
+            (512, 20000, None),
+            (839, 8000, 8192),
+            (1023, 1023, None),
+            (1023, 20000, None),
+            # below the fused threshold
+            (63, 4096, None),
+            (16, 8192, None),
+        ]
+        for dtype in (mx.float16, mx.bfloat16):
+            for qL, kL, cache_len in cases:
+                with self.subTest(dtype=dtype, qL=qL, kL=kL, cache_len=cache_len):
+                    q = (5e-1 * mx.random.normal(shape=(1, Nq, qL, D))).astype(dtype)
+                    kv_len = cache_len or kL
+                    k_cache = 5e-1 * mx.random.normal(shape=(1, Nkv, kv_len, D))
+                    v_cache = 5e-1 * mx.random.normal(shape=(1, Nkv, kv_len, D))
+                    if cache_len is not None:
+                        k_cache[..., kL:, :] = 1e2
+                        v_cache[..., kL:, :] = 1e3
+                    k = k_cache.astype(dtype)[..., :kL, :]
+                    v = v_cache.astype(dtype)[..., :kL, :]
+                    ref = mlx_ref_attn(
+                        q.astype(mx.float32),
+                        k.astype(mx.float32),
+                        v.astype(mx.float32),
+                        scale=scale,
+                        mask="causal",
+                    )
+                    out = mx.fast.scaled_dot_product_attention(
+                        q, k, v, scale=scale, mask="causal"
+                    )
+                    self.assertEqual(out.shape, ref.shape)
+                    tol = 5e-3 if dtype == mx.bfloat16 else 1e-3
+                    self.assertTrue(
+                        mx.allclose(out.astype(mx.float32), ref, atol=tol, rtol=tol)
+                    )
+
+        # Attention sinks
+        for dtype in (mx.float16, mx.bfloat16):
+            with self.subTest(dtype=dtype, sinks=True):
+                q = (5e-1 * mx.random.normal(shape=(1, Nq, 512, D))).astype(dtype)
+                k = (5e-1 * mx.random.normal(shape=(1, Nkv, 4096, D))).astype(dtype)
+                v = (5e-1 * mx.random.normal(shape=(1, Nkv, 4096, D))).astype(dtype)
+                sinks = mx.random.normal(shape=(Nq,)).astype(dtype)
+                ref = mlx_ref_attn(
+                    q.astype(mx.float32),
+                    k.astype(mx.float32),
+                    v.astype(mx.float32),
+                    scale=scale,
+                    mask="causal",
+                    sinks=sinks.astype(mx.float32),
+                )
+                out = mx.fast.scaled_dot_product_attention(
+                    q, k, v, scale=scale, mask="causal", sinks=sinks
+                )
+                tol = 5e-3 if dtype == mx.bfloat16 else 1e-3
+                self.assertTrue(
+                    mx.allclose(out.astype(mx.float32), ref, atol=tol, rtol=tol)
+                )
+
     @unittest.skipIf(not mx.metal.is_available(), "Metal kernel path only")
     def test_sdpa_full_head_dim_512_nax(self):
         if mx.default_device() != mx.gpu:
