@@ -825,6 +825,132 @@ struct QuantizedBlockLoader<
   }
 };
 
+// Weight loader for the NAX qmm_t kernel (reduction dim is the contiguous one).
+// Unlike QuantizedBlockLoader it does not require
+// tgp_size == BROWS * BCOLS / group_size: each thread dequantizes segments of
+// 32 columns of one row and loops over passes when there are more segments
+// than threads, which allows larger BK and smaller BN tiles.
+template <
+    typename T,
+    short BROWS,
+    short BCOLS,
+    short dst_ld,
+    short tgp_size,
+    short group_size,
+    short bits>
+struct QuantizedBlockLoaderT {
+  MLX_MTL_CONST short pack_factor = get_pack_factor<bits, 8>();
+  MLX_MTL_CONST short bytes_per_pack = get_bytes_per_pack<bits>();
+  // one segment = 32 columns (the smallest group size), so that threads share
+  // the dequantization work evenly for every group size
+  MLX_MTL_CONST short SEGW = 32;
+  MLX_MTL_CONST short n_reads = SEGW / pack_factor;
+  MLX_MTL_CONST short segs_per_row = BCOLS / SEGW;
+  MLX_MTL_CONST short n_segs = BROWS * segs_per_row;
+  MLX_MTL_CONST short n_pass = (n_segs + tgp_size - 1) / tgp_size;
+  MLX_MTL_CONST short rows_per_pass = tgp_size / segs_per_row;
+  MLX_MTL_CONST short group_steps = group_size > BCOLS ? group_size / BCOLS : 1;
+  MLX_MTL_CONST short groups_per_tile =
+      group_size > BCOLS ? 1 : BCOLS / group_size;
+  MLX_MTL_CONST short tile_stride = BCOLS * bytes_per_pack / pack_factor;
+
+  static_assert(tgp_size % segs_per_row == 0, "tgp_size vs segments");
+
+  const int src_ld;
+  short group_step_cnt;
+  const short bi;
+  const short bj;
+  const short thread_idx;
+
+  threadgroup T* dst;
+  const device uint8_t* src;
+  const device T* scales;
+  const device T* biases;
+
+  QuantizedBlockLoaderT(
+      const device uint8_t* src_,
+      const device T* scales_,
+      const device T* biases_,
+      const int src_ld_,
+      threadgroup T* dst_,
+      ushort simd_group_id [[simdgroup_index_in_threadgroup]],
+      ushort simd_lane_id [[thread_index_in_simdgroup]]) thread
+      : src_ld(src_ld_),
+        group_step_cnt(0),
+        bi((simd_group_id * 32 + simd_lane_id) / segs_per_row),
+        bj((simd_group_id * 32 + simd_lane_id) % segs_per_row),
+        thread_idx(simd_group_id * 32 + simd_lane_id),
+        dst(dst_ + bi * dst_ld + bj * SEGW),
+        src(src_ + bi * src_ld * bytes_per_pack / pack_factor +
+            bj * SEGW * bytes_per_pack / pack_factor),
+        scales(scales_ + bi * src_ld / group_size + (bj * SEGW) / group_size),
+        biases(biases_ + bi * src_ld / group_size + (bj * SEGW) / group_size) {}
+
+  void load_unsafe() const thread {
+    STEEL_PRAGMA_UNROLL
+    for (short p = 0; p < n_pass; p++) {
+      if (n_pass == 1 && n_segs < tgp_size && thread_idx >= n_segs) {
+        return;
+      }
+      const short off_r = p * rows_per_pass;
+      const device uint8_t* s =
+          src + off_r * src_ld * bytes_per_pack / pack_factor;
+      const device T* sc = scales + off_r * src_ld / group_size;
+      const device T* bs = biases + off_r * src_ld / group_size;
+      threadgroup T* d = dst + off_r * dst_ld;
+      T scale = *sc;
+      T bias = *bs;
+      for (int i = 0; i < n_reads; i++) {
+        dequantize<T, pack_factor, bits>(
+            s + i * bytes_per_pack, scale, bias, d + i * pack_factor);
+      }
+    }
+  }
+
+  void load_safe(short2 src_tile_dim) const thread {
+    // src_tile_dim.y: number of valid rows
+    STEEL_PRAGMA_UNROLL
+    for (short p = 0; p < n_pass; p++) {
+      if (n_pass == 1 && n_segs < tgp_size && thread_idx >= n_segs) {
+        return;
+      }
+      const short off_r = p * rows_per_pass;
+      threadgroup T* d = dst + off_r * dst_ld;
+      if (bi + off_r >= src_tile_dim.y) {
+        for (int i = 0; i < SEGW; i++) {
+          d[i] = T(0);
+        }
+        continue;
+      }
+      const device uint8_t* s =
+          src + off_r * src_ld * bytes_per_pack / pack_factor;
+      const device T* sc = scales + off_r * src_ld / group_size;
+      const device T* bs = biases + off_r * src_ld / group_size;
+      T scale = *sc;
+      T bias = *bs;
+      for (int i = 0; i < n_reads; i++) {
+        dequantize<T, pack_factor, bits>(
+            s + i * bytes_per_pack, scale, bias, d + i * pack_factor);
+      }
+    }
+  }
+
+  void next() thread {
+    src += tile_stride;
+    if (group_size > BCOLS) {
+      group_step_cnt++;
+      if (group_step_cnt == group_steps) {
+        group_step_cnt = 0;
+        scales++;
+        biases++;
+      }
+    } else {
+      scales += groups_per_tile;
+      biases += groups_per_tile;
+    }
+  }
+};
+
 template <typename T>
 METAL_FUNC void adjust_matrix_offsets(
     const device T*& x,
@@ -952,12 +1078,11 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
 
   constexpr int BK_padded = (BK + 16 / sizeof(T));
 
-  using loader_w_t = QuantizedBlockLoader<
+  using loader_w_t = QuantizedBlockLoaderT<
       T,
       BN,
       BK,
       BK_padded,
-      1,
       WM * WN * SIMD_SIZE,
       group_size,
       bits>;

@@ -840,6 +840,14 @@ void qmm_nax(
   int bm = (transpose && M <= 32) ? 32 : 64;
   int bn = 64;
   int bk = 64;
+  // For large M with 16-bit activations, a 128x64 output tile with BK = 128
+  // amortizes the dequantization and the threadgroup barriers over more MMA
+  // work. The 4-byte float32 tile does not fit in threadgroup memory.
+  if (mode == "affine" && transpose && M > 64 && K % 128 == 0 &&
+      x.dtype() != float32) {
+    bm = 128;
+    bk = 128;
+  }
   MTL::Size group_dims(32, wn, wm);
   MTL::Size grid_dims((N + bn - 1) / bn, (M + bm - 1) / bm, B);
 

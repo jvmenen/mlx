@@ -437,6 +437,56 @@ class TestQuantized(mlx_tests.MLXTestCase):
                 tol = 1e-3 if dtype == mx.float32 else 1.5e-3
                 self.assertLess((y_q - y_hat).abs().max(), tol)
 
+    @unittest.skipIf(not mx.is_available(mx.gpu), "GPU kernel path only")
+    def test_qmm_large_m(self):
+        # Large M with 16-bit activations uses a 128 x 64 x 128 tile on NAX
+        # devices when K is a multiple of 128 (K = 1024, 256). K = 192 is a
+        # multiple of the 32 and 64 group sizes but not of 128 and keeps the
+        # default tile, as does float32. N = 200 leaves a partial N tile and
+        # M = 65 and M = 4097 leave a partial M tile.
+        key = mx.random.key(0)
+        k1, k2 = mx.random.split(key)
+        tests = product(
+            [mx.float16, mx.bfloat16],  # dtype
+            [32, 64, 128],  # group_size
+            [2, 3, 4, 5, 6, 8],  # bits
+            [65, 128, 1024, 4097],  # M
+            [192, 200],  # N
+            [256, 1024, 192],  # K
+        )
+        for dtype, group_size, bits, M, N, K in tests:
+            if K % group_size != 0:
+                continue
+            with self.subTest(
+                dtype=dtype, shape=(M, N, K), group_size=group_size, bits=bits
+            ):
+                x = (mx.random.normal(shape=(M, K), key=k1) / K**0.5).astype(dtype)
+                w = (mx.random.normal(shape=(N, K), key=k2) / K**0.5).astype(dtype)
+                w_q, scales, biases = mx.quantize(w, group_size, bits)
+                w_hat = mx.dequantize(w_q, scales, biases, group_size, bits)
+                y_q = mx.quantized_matmul(
+                    x, w_q, scales, biases, True, group_size, bits
+                )
+                y_hat = x.astype(mx.float32) @ w_hat.astype(mx.float32).T
+                self.assertEqual(y_q.shape, y_hat.shape)
+                tol = 1.5e-3 if dtype == mx.float16 else 1.5e-2
+                self.assertLess((y_q.astype(mx.float32) - y_hat).abs().max(), tol)
+
+        # Batched x
+        group_size, bits, N, K = 64, 4, 192, 1024
+        for dtype, M in product([mx.float16, mx.bfloat16], [65, 256]):
+            with self.subTest(dtype=dtype, shape=(2, M, N, K)):
+                x = (mx.random.normal(shape=(2, M, K), key=k1) / K**0.5).astype(dtype)
+                w = (mx.random.normal(shape=(N, K), key=k2) / K**0.5).astype(dtype)
+                w_q, scales, biases = mx.quantize(w, group_size, bits)
+                w_hat = mx.dequantize(w_q, scales, biases, group_size, bits)
+                y_q = mx.quantized_matmul(
+                    x, w_q, scales, biases, True, group_size, bits
+                )
+                y_hat = x.astype(mx.float32) @ w_hat.astype(mx.float32).T
+                tol = 1.5e-3 if dtype == mx.float16 else 1.5e-2
+                self.assertLess((y_q.astype(mx.float32) - y_hat).abs().max(), tol)
+
     @unittest.skipIf("CI" in os.environ, "too slow in CI")
     def test_qmm_non_transposed(self):
         # The non-transposed matmul (w is [K, N]) is reachable mainly from the
