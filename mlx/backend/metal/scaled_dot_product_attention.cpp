@@ -1413,6 +1413,7 @@ bool ScaledDotProductAttention::use_fallback(
   }
 
   const int query_sequence_length = q.shape(2);
+  const int key_sequence_length = k.shape(2);
   const int query_head_dim = q.shape(-1);
   const int value_head_dim = v.shape(-1);
 
@@ -1434,6 +1435,17 @@ bool ScaledDotProductAttention::use_fallback(
       (env::enable_tf32() || q.dtype() != float32) &&
       query_sequence_length >= 1024 && query_head_dim == 256 &&
       (do_causal || has_arr_mask)) {
+    return false;
+  }
+
+  // Shorter causal 16-bit query chunks, as at the end of a chunked prefill, are
+  // also faster on the fused kernel: from 512 rows on, and from 256 rows when
+  // the key sequence is long. Below that the unfused path is as fast or faster.
+  if (metal::is_nax_available() &&
+      (q.dtype() == float16 || q.dtype() == bfloat16) &&
+      query_head_dim == 256 && do_causal && !has_arr_mask &&
+      (query_sequence_length >= 512 ||
+       (query_sequence_length >= 256 && key_sequence_length >= 8192))) {
     return false;
   }
 
