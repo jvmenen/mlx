@@ -1,4 +1,5 @@
 // Copyright © 2024 Apple Inc.
+#include <cstdlib>
 #include <sstream>
 
 #include "mlx/backend/common/compiled.h"
@@ -712,6 +713,14 @@ std::tuple<bool, std::string> has_fused_kernel(
 
 } // namespace
 
+static int d256_min_q() {
+  static int v = [] {
+    const char* e = std::getenv("MLX_SDPA_D256_MINQ");
+    return e ? std::atoi(e) : 1024;
+  }();
+  return v;
+}
+
 bool ScaledDotProductAttention::use_fallback(
     const array& q,
     const array& k,
@@ -753,8 +762,8 @@ bool ScaledDotProductAttention::use_fallback(
   // blocks to fill the machine.
   if (metal::is_nax_available() &&
       (env::enable_tf32() || q.dtype() != float32) &&
-      query_sequence_length >= 1024 && query_head_dim == 256 && do_causal &&
-      !has_arr_mask) {
+      query_sequence_length >= d256_min_q() && query_head_dim == 256 &&
+      do_causal && !has_arr_mask) {
     return false;
   }
 
