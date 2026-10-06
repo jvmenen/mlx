@@ -1,3 +1,4 @@
+import io
 import math
 import os
 import unittest
@@ -406,12 +407,12 @@ class TestFastSDPA(mlx_tests.MLXTestCase):
 
     @unittest.skipIf(not mx.is_available(mx.gpu), "GPU kernel path only")
     def test_sdpa_full_head_dim_256_short_query(self):
-        # Causal 16-bit head dim 256 attention with at least 64 query rows
-        # (one query block of the NAX kernel) takes the fused kernel on NAX
-        # devices, including a short chunk appended to a long cached prefix.
-        # Fewer rows and float32 keep the unfused path. K/V are also sliced
-        # out of a longer preallocated cache, with large finite stale rows
-        # behind the slice.
+        # Numerics of causal 16-bit head dim 256 attention for short query
+        # chunks, including a short chunk appended to a long cached prefix,
+        # on both sides of the fused/unfused threshold (the routing itself is
+        # checked in test_sdpa_full_head_dim_256_short_query_routing). K/V
+        # are also sliced out of a longer preallocated cache, with large
+        # finite stale rows behind the slice.
         D = 256
         Nq, Nkv = 8, 2
         scale = D**-0.5
@@ -422,6 +423,8 @@ class TestFastSDPA(mlx_tests.MLXTestCase):
             (64, 4096, None),
             (65, 4097, 4224),
             (129, 8192, None),
+            (256, 8192, None),
+            (300, 12000, 12288),
             (512, 512, None),
             (512, 20000, None),
             (839, 8000, 8192),
@@ -481,6 +484,40 @@ class TestFastSDPA(mlx_tests.MLXTestCase):
                 self.assertTrue(
                     mx.allclose(out.astype(mx.float32), ref, atol=tol, rtol=tol)
                 )
+
+    @unittest.skipIf(not mx.metal.is_available(), "Metal kernel path only")
+    def test_sdpa_full_head_dim_256_short_query_routing(self):
+        # A fused call keeps a ScaledDotProductAttention node in the graph,
+        # while the unfused fallback expands to matmul and softmax nodes.
+        if mx.default_device() != mx.gpu:
+            self.skipTest("requires GPU")
+
+        def is_fused(qL, kL, dtype=mx.bfloat16, mask="causal"):
+            D = 256
+            q = mx.zeros((1, 8, qL, D), dtype)
+            k = mx.zeros((1, 2, kL, D), dtype)
+            out = mx.fast.scaled_dot_product_attention(
+                q, k, k, scale=D**-0.5, mask=mask
+            )
+            buf = io.StringIO()
+            mx.export_to_dot(buf, out)
+            return "ScaledDotProductAttention" in buf.getvalue()
+
+        # 1024 rows is already fused on NAX devices
+        if not is_fused(1024, 1024):
+            self.skipTest("requires NAX")
+
+        for dtype in (mx.float16, mx.bfloat16):
+            self.assertTrue(is_fused(512, 512, dtype))
+            self.assertTrue(is_fused(1023, 20000, dtype))
+            self.assertTrue(is_fused(256, 8192, dtype))
+            self.assertFalse(is_fused(256, 8191, dtype))
+            self.assertFalse(is_fused(255, 20000, dtype))
+            self.assertFalse(is_fused(511, 4096, dtype))
+
+        # float32 and array masks keep the unfused path
+        self.assertFalse(is_fused(512, 512, mx.float32))
+        self.assertFalse(is_fused(512, 4096, mask=mx.zeros((512, 4096), mx.bool_)))
 
     @unittest.skipIf(not mx.metal.is_available(), "Metal kernel path only")
     def test_sdpa_full_head_dim_512_nax(self):
