@@ -265,7 +265,36 @@ void init_fast(nb::module_& parent_module) {
          const std::variant<std::monostate, std::string, mx::array>& mask,
          const std::optional<mx::array>& sinks,
          bool force_fused,
-         mx::StreamOrDevice s) {
+         bool return_lse,
+         mx::StreamOrDevice s) -> nb::object {
+        auto run = [&](const std::string& mask_mode,
+                       std::optional<mx::array> mask_arr) -> nb::object {
+          if (return_lse) {
+            auto [out, lse] = mx::fast::scaled_dot_product_attention_lse(
+                queries,
+                keys,
+                values,
+                scale,
+                mask_mode,
+                std::move(mask_arr),
+                sinks,
+                force_fused,
+                s);
+            return nb::make_tuple(std::move(out), std::move(lse));
+          }
+          return nb::cast(
+              mx::fast::scaled_dot_product_attention(
+                  queries,
+                  keys,
+                  values,
+                  scale,
+                  mask_mode,
+                  std::move(mask_arr),
+                  sinks,
+                  force_fused,
+                  s));
+        };
+
         bool has_mask = !std::holds_alternative<std::monostate>(mask);
         bool has_str_mask =
             has_mask && std::holds_alternative<std::string>(mask);
@@ -280,33 +309,14 @@ void init_fast(nb::module_& parent_module) {
                   << mask_str << "'. Must be 'causal', or an array.";
               throw std::invalid_argument(msg.str());
             }
-            return mx::fast::scaled_dot_product_attention(
-                queries,
-                keys,
-                values,
-                scale,
-                mask_str,
-                std::nullopt,
-                sinks,
-                force_fused,
-                s);
+            return run(mask_str, std::nullopt);
           } else {
             auto mask_arr = std::get<mx::array>(mask);
-            return mx::fast::scaled_dot_product_attention(
-                queries,
-                keys,
-                values,
-                scale,
-                "",
-                mask_arr,
-                sinks,
-                force_fused,
-                s);
+            return run("", mask_arr);
           }
 
         } else {
-          return mx::fast::scaled_dot_product_attention(
-              queries, keys, values, scale, "", {}, sinks, force_fused, s);
+          return run("", std::nullopt);
         }
       },
       "q"_a,
@@ -317,9 +327,10 @@ void init_fast(nb::module_& parent_module) {
       "mask"_a = nb::none(),
       "sinks"_a = nb::none(),
       "force_fused"_a = false,
+      "return_lse"_a = false,
       "stream"_a = nb::none(),
       nb::sig(
-          "def scaled_dot_product_attention(q: array, k: array, v: array, *, scale: float,  mask: None | str | array = None, sinks: array | None = None, force_fused: bool = False, stream: StreamOrDevice = None) -> array"),
+          "def scaled_dot_product_attention(q: array, k: array, v: array, *, scale: float,  mask: None | str | array = None, sinks: array | None = None, force_fused: bool = False, return_lse: bool = False, stream: StreamOrDevice = None) -> array | tuple[array, array]"),
       R"pbdoc(
         A fast implementation of multi-head attention: ``O = softmax(Q @ K.T, dim=-1) @ V``.
 
@@ -366,9 +377,19 @@ void init_fast(nb::module_& parent_module) {
                fused kernel is available. For certain configurations this would
                result in slower kernel getting used but can reduce memory
                consumption. Default: ``False``.
+            return_lse (bool, optional): If ``True``, also return the
+               log-sum-exp of the scaled and masked scores over the key
+               axis (including the sinks, if given). It is computed in
+               ``float32``, has shape ``[B, N_q, T_q, 1]`` and, together with
+               the output, allows the exact combination of attention over
+               separate sets of keys and values. For ``T_q > 8`` the fused
+               kernels produce it at almost no extra cost; otherwise it is
+               computed with an additional pass over the scores.
+               Default: ``False``.
 
         Returns:
-            array: The output array.
+            array or tuple[array, array]: The output array or, if
+            ``return_lse`` is ``True``, the output and the log-sum-exp.
 
         Example:
 

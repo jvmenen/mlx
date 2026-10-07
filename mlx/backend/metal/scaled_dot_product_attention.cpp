@@ -26,7 +26,8 @@ void sdpa_full_self_attention_nax(
     array& o,
     bool do_causal_,
     const std::optional<array>& mask,
-    const std::optional<array>& sinks) {
+    const std::optional<array>& sinks,
+    array* lse) {
   using namespace mlx::steel;
 
   int bd = q.shape(-1);
@@ -80,13 +81,15 @@ void sdpa_full_self_attention_nax(
   const bool has_mask = mask.has_value();
   const bool do_causal = do_causal_;
   const bool has_sinks = sinks.has_value();
+  const bool output_lse = lse != nullptr;
 
   metal::MTLFCList func_consts = {
       {&align_Q, MTL::DataType::DataTypeBool, 200},
       {&align_K, MTL::DataType::DataTypeBool, 201},
       {&has_mask, MTL::DataType::DataTypeBool, 300},
       {&do_causal, MTL::DataType::DataTypeBool, 301},
-      {&has_sinks, MTL::DataType::DataTypeBool, 302}};
+      {&has_sinks, MTL::DataType::DataTypeBool, 302},
+      {&output_lse, MTL::DataType::DataTypeBool, 303}};
 
   std::string base_name;
   concatenate(
@@ -121,7 +124,9 @@ void sdpa_full_self_attention_nax(
       "_do_causal_",
       (do_causal ? 't' : 'n'),
       "_has_sinks_",
-      (has_sinks ? 't' : 'n'));
+      (has_sinks ? 't' : 'n'),
+      "_output_lse_",
+      (output_lse ? 't' : 'n'));
 
   auto& compute_encoder = metal::get_command_encoder(s);
 
@@ -192,6 +197,9 @@ void sdpa_full_self_attention_nax(
   if (has_sinks) {
     compute_encoder.set_input_array(*sinks, 7);
   }
+  if (output_lse) {
+    compute_encoder.set_output_array(*lse, 8);
+  }
 
   MTL::Size grid_dims = MTL::Size(NQ, H, B);
   MTL::Size group_dims = MTL::Size(32, wm, wn);
@@ -210,7 +218,8 @@ void sdpa_full_self_attention_metal(
     array& o,
     bool do_causal_,
     const std::optional<array>& mask,
-    const std::optional<array>& sinks) {
+    const std::optional<array>& sinks,
+    array* lse) {
   int B = q.shape(0);
   int H = q.shape(1);
   int D = q.shape(3);
@@ -232,7 +241,8 @@ void sdpa_full_self_attention_metal(
         /* array& o = */ o,
         /* bool do_causal_ = */ do_causal_,
         /* const std::optional<array>& mask = */ mask,
-        /* const std::optional<array>& sinks = */ sinks);
+        /* const std::optional<array>& sinks = */ sinks,
+        /* array* lse = */ lse);
   }
 
   // Pad head dims 72 and 80 to 96 to reach the NAX kernel. The added lanes
@@ -287,7 +297,8 @@ void sdpa_full_self_attention_metal(
         /* array& o = */ op,
         /* bool do_causal_ = */ do_causal_,
         /* const std::optional<array>& mask = */ mask,
-        /* const std::optional<array>& sinks = */ sinks);
+        /* const std::optional<array>& sinks = */ sinks,
+        /* array* lse = */ lse);
 
     // Slice the padded lanes back out into o's caller-chosen strides.
     copy_gpu_inplace(
@@ -323,13 +334,15 @@ void sdpa_full_self_attention_metal(
   const bool has_mask = mask.has_value();
   const bool do_causal = do_causal_;
   const bool has_sinks = sinks.has_value();
+  const bool output_lse = lse != nullptr;
 
   metal::MTLFCList func_consts = {
       {&align_Q, MTL::DataType::DataTypeBool, 200},
       {&align_K, MTL::DataType::DataTypeBool, 201},
       {&has_mask, MTL::DataType::DataTypeBool, 300},
       {&do_causal, MTL::DataType::DataTypeBool, 301},
-      {&has_sinks, MTL::DataType::DataTypeBool, 302}};
+      {&has_sinks, MTL::DataType::DataTypeBool, 302},
+      {&output_lse, MTL::DataType::DataTypeBool, 303}};
 
   std::string base_name;
   concatenate(
@@ -364,7 +377,9 @@ void sdpa_full_self_attention_metal(
       "_do_causal_",
       (do_causal ? 't' : 'n'),
       "_has_sinks_",
-      (has_sinks ? 't' : 'n'));
+      (has_sinks ? 't' : 'n'),
+      "_output_lse_",
+      (output_lse ? 't' : 'n'));
 
   auto& compute_encoder = metal::get_command_encoder(s);
 
@@ -433,6 +448,9 @@ void sdpa_full_self_attention_metal(
   }
   if (has_sinks) {
     compute_encoder.set_input_array(*sinks, 7);
+  }
+  if (output_lse) {
+    compute_encoder.set_output_array(*lse, 8);
   }
 
   MTL::Size grid_dims = MTL::Size(NQ, H, B);
@@ -727,13 +745,6 @@ std::tuple<bool, std::string> has_fused_kernel(
   if (s.device != Device::gpu) {
     return {false, "the fused kernels require a GPU (Metal) stream."};
   }
-  if (output_logsumexp) {
-    return {
-        false,
-        "the fused forward does not produce the logsumexp required for "
-        "the fused VJP; use default routing when training."};
-  }
-
   const int value_head_dim = v.shape(-1);
   const int query_head_dim = q.shape(-1);
   const int query_sequence_length = q.shape(2);
@@ -743,6 +754,13 @@ std::tuple<bool, std::string> has_fused_kernel(
   const int gqa_factor = num_query_heads / num_kv_heads;
 
   std::ostringstream msg;
+  if (output_logsumexp && query_sequence_length <= 8) {
+    return {
+        false,
+        "the vector attention kernel does not produce the logsumexp; it is "
+        "only available from the full attention kernel (more than 8 "
+        "queries)."};
+  }
   if (query_sequence_length > 8) {
     const bool supports_d512 = metal::is_nax_available() &&
         (env::enable_tf32() || q.dtype() != float32);
@@ -761,6 +779,25 @@ std::tuple<bool, std::string> has_fused_kernel(
           << "query head dim " << query_head_dim << " and value head dim "
           << value_head_dim << ".";
       return {false, msg.str()};
+    }
+    // Without NAX the full attention kernel keeps a Q tile and a K/V tile in
+    // threadgroup memory, which does not fit for wide heads in float32.
+    if (!(metal::is_nax_available() &&
+          (query_head_dim == 64 || query_head_dim == 96 ||
+           query_head_dim == 128 || query_head_dim == 256 ||
+           query_head_dim == 512) &&
+          (env::enable_tf32() || q.dtype() != float32))) {
+      const int bk = query_head_dim < 128 ? 32 : 16;
+      const int pad = 16 / q.itemsize();
+      const int tgp_q = 32 * (query_head_dim + pad);
+      const int tgp_kv =
+          std::max((bk + pad) * query_head_dim, bk * (query_head_dim + pad));
+      if ((tgp_q + tgp_kv) * q.itemsize() > 32768) {
+        msg << "the full attention kernel needs more threadgroup memory than "
+            << "available for head dim " << query_head_dim << " and type "
+            << q.dtype() << " without NAX.";
+        return {false, msg.str()};
+      }
     }
     if (has_mask && !has_arr_mask &&
         !(query_sequence_length <= key_sequence_length && do_causal)) {
@@ -874,6 +911,10 @@ bool ScaledDotProductAttention::use_fallback(
   }
   if (!has_fused) {
     return true;
+  }
+  if (output_logsumexp) {
+    // Only the fused kernels produce the logsumexp without a second pass.
+    return false;
   }
 
   const int query_sequence_length = q.shape(2);
@@ -1057,8 +1098,15 @@ void ScaledDotProductAttention::eval_gpu(
         ? std::optional<array>{copy_unless(is_matrix_contiguous, inputs[3])}
         : std::nullopt;
 
+    array* lse = nullptr;
+    if (output_logsumexp_) {
+      auto& lse_out = outputs[1];
+      lse_out.set_data(allocator::malloc(lse_out.nbytes()));
+      lse = &lse_out;
+    }
+
     sdpa_full_self_attention_metal(
-        s, d, q, k, v, scale_, o, do_causal_, mask, sinks);
+        s, d, q, k, v, scale_, o, do_causal_, mask, sinks, lse);
   }
 
   metal::get_command_encoder(s).add_temporaries(std::move(copies));
