@@ -1263,6 +1263,111 @@ class TestFastSDPA(mlx_tests.MLXTestCase):
                 )
                 self.assertTrue(mx.allclose(ref, out, atol=1e-3, rtol=1e-3))
 
+    def test_sdpa_return_lse(self):
+        def fp32_ref(q, k, v, scale, mask, sinks):
+            q, k, v = (x.astype(mx.float32) for x in (q, k, v))
+            n_rep = q.shape[1] // k.shape[1]
+            k = mx.repeat(k, n_rep, axis=1)
+            v = mx.repeat(v, n_rep, axis=1)
+            scores = (q * scale) @ mx.swapaxes(k, -1, -2)
+            qL, kL = q.shape[2], k.shape[2]
+            if mask == "causal":
+                keep = (mx.arange(qL) + (kL - qL))[:, None] >= mx.arange(kL)[None]
+                scores = mx.where(keep, scores, -mx.inf)
+            elif mask is not None:
+                scores = scores + mask.astype(mx.float32)
+            if sinks is not None:
+                s = mx.broadcast_to(
+                    sinks.astype(mx.float32)[None, :, None, None],
+                    scores.shape[:-1] + (1,),
+                )
+                scores = mx.concatenate([s, scores], axis=-1)
+            lse = mx.logsumexp(scores, axis=-1, keepdims=True)
+            p = mx.exp(scores - lse)
+            if sinks is not None:
+                p = p[..., 1:]
+            return p @ v, lse
+
+        tol = {mx.float32: 1e-3, mx.float16: 1e-2, mx.bfloat16: 2e-2}
+        for dtype, D, (qL, kL), mask, sinks in product(
+            (mx.float16, mx.bfloat16, mx.float32),
+            (64, 80, 128, 256),
+            ((1, 70), (4, 70), (40, 40), (100, 300), (130, 130)),
+            (None, "causal", "array"),
+            (False, True),
+        ):
+            with self.subTest(dtype=dtype, D=D, qL=qL, kL=kL, mask=mask, sinks=sinks):
+                B, qH, kH = 1, 8, 2
+                q = mx.random.normal((B, qH, qL, D)).astype(dtype)
+                k = mx.random.normal((B, kH, kL, D)).astype(dtype)
+                v = mx.random.normal((B, kH, kL, D)).astype(dtype)
+                snk = mx.random.normal((qH,)).astype(dtype) if sinks else None
+                scale = D**-0.5
+                m = mask
+                if mask == "array":
+                    m = mx.random.normal((B, 1, qL, kL)).astype(dtype)
+                if mask == "causal" and qL > kL:
+                    continue
+
+                out, lse = mx.fast.scaled_dot_product_attention(
+                    q, k, v, scale=scale, mask=m, sinks=snk, return_lse=True
+                )
+                out_plain = mx.fast.scaled_dot_product_attention(
+                    q, k, v, scale=scale, mask=m, sinks=snk
+                )
+                ref_out, ref_lse = fp32_ref(q, k, v, scale, m, snk)
+
+                self.assertEqual(lse.dtype, mx.float32)
+                self.assertEqual(lse.shape, (B, qH, qL, 1))
+                self.assertEqual(out.dtype, dtype)
+                self.assertEqual(out.shape, out_plain.shape)
+                self.assertLess(mx.abs(lse - ref_lse).max().item(), tol[dtype])
+                self.assertLess(
+                    mx.abs(out.astype(mx.float32) - ref_out).max().item(),
+                    tol[dtype],
+                )
+
+    def test_sdpa_return_lse_merge(self):
+        # Attention over separate key/value segments, merged with the lse of
+        # each, equals attention over all of them.
+        D, qH, kH, qL = 256, 8, 2, 200
+        scale = D**-0.5
+        dtype = mx.bfloat16
+        q = mx.random.normal((1, qH, qL, D)).astype(dtype)
+        ks = [mx.random.normal((1, kH, n, D)).astype(dtype) for n in (300, 77, 500)]
+        vs = [mx.random.normal((1, kH, n, D)).astype(dtype) for n in (300, 77, 500)]
+        k_own = mx.random.normal((1, kH, qL, D)).astype(dtype)
+        v_own = mx.random.normal((1, kH, qL, D)).astype(dtype)
+
+        parts = [
+            mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, return_lse=True)
+            for k, v in zip(ks, vs)
+        ]
+        parts.append(
+            mx.fast.scaled_dot_product_attention(
+                q, k_own, v_own, scale=scale, mask="causal", return_lse=True
+            )
+        )
+        lses = mx.stack([p[1] for p in parts])
+        total = mx.logsumexp(lses, axis=0)
+        out = sum(mx.exp(l - total) * o.astype(mx.float32) for o, l in parts)
+
+        k_all = mx.concatenate(ks + [k_own], axis=2)
+        v_all = mx.concatenate(vs + [v_own], axis=2)
+        n_old = sum(k.shape[2] for k in ks)
+        keep = mx.concatenate(
+            [mx.ones((qL, n_old), mx.bool_), mx.tril(mx.ones((qL, qL), mx.bool_))],
+            axis=1,
+        )
+        ref = mlx_ref_attn(
+            q.astype(mx.float32),
+            k_all.astype(mx.float32),
+            v_all.astype(mx.float32),
+            scale=scale,
+            mask=keep,
+        )
+        self.assertLess(mx.abs(out - ref).max().item(), 2e-2)
+
     def test_sdpa_sliced(self):
         N = 8
         D = 64
