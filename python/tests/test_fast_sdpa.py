@@ -1,11 +1,13 @@
+import json
 import math
 import os
+import subprocess
+import sys
 import unittest
 from itertools import product
 
 import mlx.core as mx
 import mlx_tests
-import numpy as np
 
 
 def mlx_ref_attn(q, k, v, scale=1.0, mask=None, sinks=None):
@@ -27,7 +29,6 @@ def mlx_ref_attn(q, k, v, scale=1.0, mask=None, sinks=None):
     scores = q @ mx.swapaxes(k, -1, -2)
     is_causal = mask == "causal"
     if mask is not None:
-
         if is_causal:
             offset = kL - L
             q_indices = mx.arange(L) + offset
@@ -360,6 +361,161 @@ class TestFastSDPA(mlx_tests.MLXTestCase):
                     else:
                         tol = 5e-3
                     self.assertTrue(mx.allclose(ref, out, atol=tol, rtol=tol))
+
+    @unittest.skipIf(not mx.is_available(mx.gpu), "GPU kernel path only")
+    def test_sdpa_full_head_dim_256_array_mask(self):
+        # Boolean and additive array masks with head dim 256 and short to
+        # medium query chunks, with and without a long cached prefix. Whether
+        # these shapes take the fused or the unfused kernel depends on the
+        # device and the routing rules; the output must match the reference
+        # either way.
+        D = 256
+        Nq, Nkv = 8, 2
+        scale = D**-0.5
+        mx.random.seed(0)
+        cases = [
+            # (qL, kL)
+            (64, 64),
+            (64, 4096),
+            (256, 256),
+            (256, 8192),
+            (1023, 1023),
+            (1023, 20000),
+        ]
+        for dtype in (mx.float16, mx.bfloat16):
+            tol = 5e-3 if dtype == mx.bfloat16 else 1e-3
+            for qL, kL in cases:
+                q = (5e-1 * mx.random.normal(shape=(1, Nq, qL, D))).astype(dtype)
+                k = (5e-1 * mx.random.normal(shape=(1, Nkv, kL, D))).astype(dtype)
+                v = (5e-1 * mx.random.normal(shape=(1, Nkv, kL, D))).astype(dtype)
+
+                # Causal with a random subset of the earlier keys removed. The
+                # diagonal stays so that no row is fully masked.
+                q_idx = mx.arange(qL)[:, None] + (kL - qL)
+                k_idx = mx.arange(kL)[None]
+                keep = mx.random.uniform(shape=(qL, kL)) > 0.25
+                bool_mask = (q_idx >= k_idx) & (keep | (q_idx == k_idx))
+                add_mask = mx.where(bool_mask, 0.0, -1e4).astype(dtype)
+
+                masks = {
+                    "bool": bool_mask,
+                    "additive": add_mask,
+                    "bool_4d": bool_mask[None, None],
+                    "additive_4d": add_mask[None, None],
+                }
+                for name, mask in masks.items():
+                    with self.subTest(dtype=dtype, qL=qL, kL=kL, mask=name):
+                        ref = mlx_ref_attn(
+                            q.astype(mx.float32),
+                            k.astype(mx.float32),
+                            v.astype(mx.float32),
+                            scale=scale,
+                            mask=mask.astype(mx.float32)
+                            if mask.dtype != mx.bool_
+                            else mask,
+                        )
+                        out = mx.fast.scaled_dot_product_attention(
+                            q, k, v, scale=scale, mask=mask
+                        )
+                        self.assertEqual(out.shape, ref.shape)
+                        self.assertTrue(
+                            mx.allclose(out.astype(mx.float32), ref, atol=tol, rtol=tol)
+                        )
+
+    @unittest.skipIf(not mx.metal.is_available(), "Metal kernel path only")
+    def test_sdpa_full_head_dim_256_minq_env(self):
+        # MLX_SDPA_D256_MINQ lowers the number of query rows from which head
+        # dim 256 attention with a causal or an array mask takes the fused
+        # kernel on NAX devices (default 1024). The value is read once per
+        # process, so each setting runs in a child process.
+        script = """
+import io, json
+import mlx.core as mx
+
+D = 256
+scale = D**-0.5
+
+def fused(qL, kL, dtype, mask):
+    q = mx.zeros((1, 8, qL, D), dtype)
+    k = mx.zeros((1, 2, kL, D), dtype)
+    out = mx.fast.scaled_dot_product_attention(q, k, k, scale=scale, mask=mask)
+    buf = io.StringIO()
+    mx.export_to_dot(buf, out)
+    return "ScaledDotProductAttention" in buf.getvalue()
+
+def masks(qL, kL, dtype):
+    b = mx.zeros((qL, kL), mx.bool_)
+    return {"causal": "causal", "bool": b, "additive": mx.zeros((qL, kL), dtype)}
+
+res = {}
+res["nax"] = fused(1024, 1024, mx.bfloat16, "causal")
+for dtype in (mx.float16, mx.bfloat16):
+    for qL in (63, 64, 256, 1023, 1024):
+        for name, m in masks(qL, 4096, dtype).items():
+            res[f"{dtype}-{qL}-{name}"] = fused(qL, 4096, dtype, m)
+
+# Numerics for the same shapes
+mx.random.seed(0)
+err = 0.0
+for dtype in (mx.float16, mx.bfloat16):
+    for qL in (64, 256, 1023):
+        q = (0.5 * mx.random.normal(shape=(1, 8, qL, D))).astype(dtype)
+        k = (0.5 * mx.random.normal(shape=(1, 2, 4096, D))).astype(dtype)
+        v = (0.5 * mx.random.normal(shape=(1, 2, 4096, D))).astype(dtype)
+        bm = (mx.arange(qL)[:, None] + 4096 - qL) >= mx.arange(4096)[None]
+        am = mx.where(bm, 0.0, -1e4).astype(dtype)
+        for mask in (bm, am, "causal"):
+            out = mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask=mask)
+            m = bm if isinstance(mask, str) else mask
+            s = (q.astype(mx.float32) * scale).reshape(1, 2, 4, qL, D) @ mx.swapaxes(
+                k.astype(mx.float32)[:, :, None], -1, -2
+            )
+            s = mx.where(m, s, -1e30) if m.dtype == mx.bool_ else s + m.astype(mx.float32)
+            p = mx.softmax(s, axis=-1)
+            ref = (p @ v.astype(mx.float32)[:, :, None]).reshape(1, 8, qL, D)
+            err = max(err, mx.abs(out.astype(mx.float32) - ref).max().item())
+res["max_err"] = err
+print(json.dumps(res))
+"""
+
+        def run(minq):
+            env = dict(os.environ)
+            env["PYTHONPATH"] = os.pathsep.join(p for p in sys.path if p)
+            env.pop("MLX_SDPA_D256_MINQ", None)
+            if minq is not None:
+                env["MLX_SDPA_D256_MINQ"] = str(minq)
+            proc = subprocess.run(
+                [sys.executable, "-c", script],
+                env=env,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            return json.loads(proc.stdout.strip().splitlines()[-1])
+
+        default = run(None)
+        if not default["nax"]:
+            self.skipTest("requires NAX")
+        lowered = run(64)
+
+        for dtype in ("float16", "bfloat16"):
+            for name in ("causal", "bool", "additive"):
+
+                def key(qL, dtype=dtype, name=name):
+                    return f"mlx.core.{dtype}-{qL}-{name}"
+
+                # Default: fused from 1024 rows only
+                self.assertTrue(default[key(1024)])
+                for qL in (63, 64, 256, 1023):
+                    self.assertFalse(default[key(qL)], (dtype, name, qL))
+                # MLX_SDPA_D256_MINQ=64: fused from 64 rows, array masks too
+                self.assertTrue(lowered[key(1024)])
+                for qL in (64, 256, 1023):
+                    self.assertTrue(lowered[key(qL)], (dtype, name, qL))
+                self.assertFalse(lowered[key(63)])
+
+        self.assertLess(default["max_err"], 5e-3)
+        self.assertLess(lowered["max_err"], 5e-3)
 
     @unittest.skipIf(not mx.metal.is_available(), "Metal kernel path only")
     def test_sdpa_full_head_dim_512_nax(self):
