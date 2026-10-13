@@ -710,17 +710,20 @@ bool RoPE::is_equivalent(const Primitive& other) const {
       forward_ == a_other.forward_);
 }
 
-/** Computes: O = softmax(Q @ K.T) @ V **/
-array scaled_dot_product_attention(
+namespace {
+
+// Returns {out} or, if return_lse is true, {out, lse}.
+std::vector<array> scaled_dot_product_attention_impl(
     const array& queries,
     const array& keys,
     const array& values,
     const float scale,
-    const std::string& mask_mode /* = "" */,
-    std::optional<array> mask_arr /* = {} */,
-    const std::optional<array>& sinks /* = {} */,
-    bool force_fused /* = false */,
-    StreamOrDevice s /* = {} */) {
+    const std::string& mask_mode,
+    std::optional<array> mask_arr,
+    const std::optional<array>& sinks,
+    bool force_fused,
+    bool return_lse,
+    StreamOrDevice s) {
   for (const auto& tensor : {queries, keys, values}) {
     if (tensor.ndim() != 4) {
       std::ostringstream msg;
@@ -811,6 +814,10 @@ array scaled_dot_product_attention(
     throw std::invalid_argument(msg.str());
   }
   bool has_sinks = sinks.has_value();
+  // The output that comes with the logsumexp is float32 for half precision
+  // inputs (see scaled_dot_product_attention_with_lse).
+  bool float32_output = return_lse && final_type != float32;
+  auto out_type = float32_output ? float32 : final_type;
 
   auto q = astype(queries, final_type, s);
   auto k = astype(keys, final_type, s);
@@ -822,11 +829,17 @@ array scaled_dot_product_attention(
                    do_causal,
                    has_sinks,
                    has_arr_mask,
+                   return_lse,
+                   float32_output,
                    s](const std::vector<array>& inputs) {
-    auto q = multiply(array(scale, inputs[0].dtype()), inputs[0], s);
+    // With float32_output the scale, scores, softmax and output are float32,
+    // so neither the scaled queries nor the output are rounded.
+    auto q = float32_output
+        ? multiply(array(scale, float32), astype(inputs[0], float32, s), s)
+        : multiply(array(scale, inputs[0].dtype()), inputs[0], s);
     int n_repeats = n_q_heads / n_kv_heads;
-    auto k = inputs[1];
-    auto v = inputs[2];
+    auto k = float32_output ? astype(inputs[1], float32, s) : inputs[1];
+    auto v = float32_output ? astype(inputs[2], float32, s) : inputs[2];
     if (n_repeats > 1) {
       q = unflatten(q, 1, {n_kv_heads, n_repeats}, s);
       k = expand_dims(k, 2, s);
@@ -866,6 +879,9 @@ array scaled_dot_product_attention(
     }
     if (has_sinks) {
       auto sinks = inputs.back();
+      if (float32_output) {
+        sinks = astype(sinks, float32, s);
+      }
       // scores has shape B N_q N_k L_q L_k
       sinks = expand_dims(sinks, {0, 2, 3}, s);
       if (scores.ndim() == 5) {
@@ -874,6 +890,11 @@ array scaled_dot_product_attention(
       auto bsx_shape = scores.shape();
       bsx_shape.back() = 1;
       scores = concatenate({broadcast_to(sinks, bsx_shape, s), scores}, -1, s);
+    }
+    std::optional<array> lse;
+    if (return_lse) {
+      lse =
+          logsumexp(astype(scores, float32, s), std::vector<int>{-1}, true, s);
     }
     scores = softmax(scores, std::vector<int>{-1}, true, s);
     if (has_sinks) {
@@ -886,6 +907,12 @@ array scaled_dot_product_attention(
     auto out = matmul(scores, v, s);
     if (n_repeats > 1) {
       out = flatten(out, 1, 2, s);
+      if (lse) {
+        lse = flatten(*lse, 1, 2, s);
+      }
+    }
+    if (lse) {
+      return std::vector<array>{out, *lse};
     }
     return std::vector<array>{out};
   };
@@ -926,8 +953,19 @@ array scaled_dot_product_attention(
 
   bool is_training = detail::in_grad_tracing();
   bool has_fast_vjp = !ScaledDotProductAttentionVJP::use_fallback(q, stream);
-  bool output_logsumexp = is_training && has_fast_vjp;
-  if (!ScaledDotProductAttention::use_fallback(
+  // The fused VJP consumes the logsumexp of the forward pass. An lse returned
+  // to the caller is differentiated through the fallback instead: the VJP
+  // kernels have no input for an lse cotangent, which would be dropped.
+  bool fallback_for_grad = return_lse && is_training;
+  if (fallback_for_grad && force_fused) {
+    throw std::invalid_argument(
+        "[scaled_dot_product_attention] force_fused=True is not supported "
+        "when differentiating a call that returns the logsumexp.");
+  }
+  bool output_logsumexp = return_lse || (is_training && has_fast_vjp);
+  std::vector<array> result;
+  if (!fallback_for_grad &&
+      !ScaledDotProductAttention::use_fallback(
           q,
           k,
           v,
@@ -957,19 +995,112 @@ array scaled_dot_product_attention(
         do_causal,
         has_sinks,
         output_logsumexp,
-        force_fused);
+        force_fused,
+        float32_output);
     if (output_logsumexp) {
-      return array::make_arrays(
+      result = array::make_arrays(
           {std::move(out_shape), Shape{q.shape(0), q.shape(1), q.shape(2), 1}},
-          {final_type, float32},
+          {out_type, float32},
           primitive,
-          std::move(inputs))[0];
+          std::move(inputs));
     } else {
-      return array(
-          std::move(out_shape), final_type, primitive, std::move(inputs));
+      result.push_back(array(
+          std::move(out_shape), final_type, primitive, std::move(inputs)));
+    }
+  } else {
+    result = fallback(std::move(inputs));
+  }
+  if (!return_lse) {
+    result.erase(result.begin() + 1, result.end());
+    return result;
+  }
+
+  // Rows without any unmasked key and without a sink have no softmax. Report
+  // them as lse = -inf whatever the backend computes for them: the kernels and
+  // the fallback fill masked scores with the lowest finite value.
+  if (!has_sinks) {
+    std::optional<array> has_key;
+    if (has_bool_mask) {
+      has_key = any(*mask_arr, std::vector<int>{-1}, true, stream);
+    } else if (mask_arr) {
+      // Additive mask: a row without keys is -inf everywhere
+      has_key = any(
+          greater(
+              *mask_arr,
+              array(-std::numeric_limits<float>::infinity(), mask_arr->dtype()),
+              stream),
+          std::vector<int>{-1},
+          true,
+          stream);
+    } else if (do_causal && queries.shape(2) > keys.shape(2)) {
+      int offset = keys.shape(2) - queries.shape(2);
+      has_key = expand_dims(
+          greater_equal(
+              arange(offset, offset + queries.shape(2), stream),
+              array(0),
+              stream),
+          1,
+          stream);
+    }
+    if (has_key) {
+      result[1] = where(
+          *has_key,
+          result[1],
+          array(-std::numeric_limits<float>::infinity(), float32),
+          stream);
     }
   }
-  return fallback(std::move(inputs))[0];
+  return result;
+}
+
+} // namespace
+
+/** Computes: O = softmax(Q @ K.T) @ V **/
+array scaled_dot_product_attention(
+    const array& queries,
+    const array& keys,
+    const array& values,
+    const float scale,
+    const std::string& mask_mode /* = "" */,
+    std::optional<array> mask_arr /* = {} */,
+    const std::optional<array>& sinks /* = {} */,
+    bool force_fused /* = false */,
+    StreamOrDevice s /* = {} */) {
+  return scaled_dot_product_attention_impl(
+      queries,
+      keys,
+      values,
+      scale,
+      mask_mode,
+      std::move(mask_arr),
+      sinks,
+      force_fused,
+      /* return_lse = */ false,
+      s)[0];
+}
+
+std::pair<array, array> scaled_dot_product_attention_with_lse(
+    const array& queries,
+    const array& keys,
+    const array& values,
+    const float scale,
+    const std::string& mask_mode /* = "" */,
+    std::optional<array> mask_arr /* = {} */,
+    const std::optional<array>& sinks /* = {} */,
+    bool force_fused /* = false */,
+    StreamOrDevice s /* = {} */) {
+  auto out = scaled_dot_product_attention_impl(
+      queries,
+      keys,
+      values,
+      scale,
+      mask_mode,
+      std::move(mask_arr),
+      sinks,
+      force_fused,
+      /* return_lse = */ true,
+      s);
+  return {std::move(out[0]), std::move(out[1])};
 }
 
 std::vector<array> ScaledDotProductAttention::vjp(
@@ -1027,7 +1158,8 @@ bool ScaledDotProductAttention::is_equivalent(const Primitive& other) const {
   return scale_ == a_other.scale_ && do_causal_ == a_other.do_causal_ &&
       has_sinks_ == a_other.has_sinks_ &&
       output_logsumexp_ == a_other.output_logsumexp_ &&
-      force_fused_ == a_other.force_fused_;
+      force_fused_ == a_other.force_fused_ &&
+      float32_output_ == a_other.float32_output_;
 }
 
 bool ScaledDotProductAttentionVJP::is_equivalent(const Primitive& other) const {

@@ -114,6 +114,50 @@ def mlx_primitives_sdpa(q, k, v, scale, mask=None):
     return scores @ v
 
 
+def mlx_ref_lse(q, k, scale=1.0, mask=None, sinks=None):
+    """Reference log-sum-exp of the scaled and masked scores, in float32."""
+    n_repeats = q.shape[1] // k.shape[1]
+    L, kL = q.shape[2], k.shape[2]
+    scores = (q.astype(mx.float32) * scale) @ mx.swapaxes(
+        mx.repeat(k.astype(mx.float32), n_repeats, axis=1), -1, -2
+    )
+    if isinstance(mask, str):
+        mask = (mx.arange(L) + (kL - L))[:, None] >= mx.arange(kL)[None]
+    if mask is not None:
+        if mask.dtype == mx.bool_:
+            scores = mx.where(mask, scores, -float("inf"))
+        else:
+            scores = scores + mask.astype(mx.float32)
+    if sinks is not None:
+        sinks = mx.broadcast_to(
+            sinks.astype(mx.float32)[None, :, None, None], scores.shape[:3] + (1,)
+        )
+        scores = mx.concatenate([sinks, scores], axis=-1)
+    return mx.logsumexp(scores, axis=-1, keepdims=True)
+
+
+def _f32_out_atol(qL, D):
+    # Tolerance of a float32 result against a float32 reference. The NAX full
+    # attention kernels (more than 8 queries, head dims 64, 96, 128, 256 and
+    # 512) multiply the probabilities into V at reduced precision, about 1e-3
+    # absolute for unit-normal inputs and well below one bfloat16 ulp; the
+    # other kernels and the fallback are float32 throughout.
+    if qL > 8 and D in (64, 96, 128, 256, 512):
+        return 3e-3
+    return 2e-5
+
+
+def merge_attention(o_1, lse_1, o_2, lse_2):
+    """Exact combination of the attention over two disjoint sets of keys.
+
+    The outputs of scaled_dot_product_attention_with_lse are float32, so the
+    result is not rounded to the input type: that is left to the caller."""
+    lse = mx.logaddexp(lse_1, lse_2)
+    o = mx.exp(lse_1 - lse) * o_1.astype(mx.float32)
+    o = o + mx.exp(lse_2 - lse) * o_2.astype(mx.float32)
+    return o, lse
+
+
 class TestFastSDPA(mlx_tests.MLXTestCase):
     @unittest.skipIf(not mx.is_available(mx.gpu), "GPU kernel path only")
     def test_sdpa_head_dim_72(self):
@@ -1391,6 +1435,424 @@ class TestFastSDPA(mlx_tests.MLXTestCase):
                     else:
                         tolerance = {"rtol": 1e-2, "atol": 1e-2}
                     self.assertTrue(mx.allclose(ref, out, **tolerance))
+
+    def test_sdpa_with_lse(self):
+        mx.random.seed(0)
+        sdpa = mx.fast.scaled_dot_product_attention
+        sdpa_lse = mx.fast.scaled_dot_product_attention_with_lse
+        tolerances = {
+            mx.float32: (1e-4, 1e-4),
+            mx.float16: (5e-3, 5e-3),
+            mx.bfloat16: (3e-2, 3e-2),
+        }
+        # (query head dim, value head dim); 96 and 192 have dedicated kernels
+        # (192 in float32 does not fit in threadgroup memory and takes the
+        # fallback) and 512 needs a NAX GPU, the fallback computes the lse
+        # otherwise.
+        head_dims = [(64, 64), (96, 96), (96, 64), (128, 128), (192, 192), (512, 512)]
+        for (D, Dv), (qL, kL), (qH, kH), mask_kind, use_sinks, dtype in product(
+            head_dims,
+            [(32, 100), (64, 64), (16, 16)],
+            [(4, 4), (8, 2)],
+            [None, "causal", "bool", "additive"],
+            [False, True],
+            [mx.float32, mx.float16, mx.bfloat16],
+        ):
+            if D == 512 and (dtype != mx.float16 or qL != 32 or use_sinks):
+                continue
+            if mask_kind == "causal" and qL > kL:
+                continue
+            with self.subTest(
+                D=D,
+                Dv=Dv,
+                qL=qL,
+                kL=kL,
+                heads=(qH, kH),
+                mask=mask_kind,
+                sinks=use_sinks,
+                dtype=dtype,
+            ):
+                q = mx.random.normal((2, qH, qL, D)).astype(dtype)
+                k = mx.random.normal((2, kH, kL, D)).astype(dtype)
+                v = mx.random.normal((2, kH, kL, Dv)).astype(dtype)
+                scale = D**-0.5
+                sinks = mx.random.normal((qH,)).astype(dtype) if use_sinks else None
+                if mask_kind == "bool":
+                    mask = mx.random.uniform(shape=(2, 1, qL, kL)) < 0.6
+                    # keep at least one key per row
+                    mask[..., 0] = True
+                elif mask_kind == "additive":
+                    mask = mx.random.normal((1, qH, qL, kL)).astype(dtype)
+                else:
+                    mask = mask_kind
+
+                out, lse = sdpa_lse(q, k, v, scale=scale, mask=mask, sinks=sinks)
+                atol, rtol = tolerances[dtype]
+                self.assertEqual(lse.dtype, mx.float32)
+                self.assertEqual(lse.shape, (2, qH, qL, 1))
+                # The output is float32 as well, it is not rounded
+                self.assertEqual(out.dtype, mx.float32)
+                self.assertEqual(out.shape, (2, qH, qL, Dv))
+                lse_ref = mlx_ref_lse(q, k, scale, mask, sinks)
+                self.assertTrue(mx.allclose(lse, lse_ref, atol=atol, rtol=rtol))
+                # The output is the one of the function without the lse, which
+                # keeps the input type
+                out_ref = sdpa(q, k, v, scale=scale, mask=mask, sinks=sinks)
+                self.assertEqual(out_ref.dtype, dtype)
+                self.assertTrue(mx.allclose(out, out_ref, atol=atol, rtol=rtol))
+                # and it is close to a float32 computation on the same inputs
+                if dtype != mx.float32:
+                    ref32 = mlx_ref_attn(
+                        q.astype(mx.float32),
+                        k.astype(mx.float32),
+                        v.astype(mx.float32),
+                        scale,
+                        mask,
+                        None if sinks is None else sinks.astype(mx.float32),
+                    )
+                    self.assertTrue(mx.allclose(out, ref32, atol=1e-2, rtol=1e-2))
+
+    def test_sdpa_with_lse_float32_output(self):
+        # The output is float32 for half precision inputs on every path (fused
+        # kernels, vector fallback, CPU); float32 inputs are unchanged.
+        mx.random.seed(0)
+        sdpa = mx.fast.scaled_dot_product_attention
+        sdpa_lse = mx.fast.scaled_dot_product_attention_with_lse
+        streams = [mx.gpu, mx.cpu] if mx.is_available(mx.gpu) else [mx.cpu]
+        for dtype, qL, D, stream in product(
+            [mx.float16, mx.bfloat16, mx.float32], [4, 33, 64], [64, 128], streams
+        ):
+            with self.subTest(dtype=dtype, qL=qL, D=D, stream=stream):
+                q = mx.random.normal((1, 8, qL, D)).astype(dtype)
+                k = mx.random.normal((1, 2, 100, D)).astype(dtype)
+                v = mx.random.normal((1, 2, 100, D)).astype(dtype)
+                out, lse = sdpa_lse(q, k, v, scale=D**-0.5, stream=stream)
+                self.assertEqual(out.dtype, mx.float32)
+                self.assertEqual(lse.dtype, mx.float32)
+                plain = sdpa(q, k, v, scale=D**-0.5, stream=stream)
+                self.assertEqual(plain.dtype, dtype)
+                # Same accumulation, rounded once more at the end
+                tol = {"atol": 1e-2, "rtol": 1e-2}
+                self.assertTrue(mx.allclose(out, plain.astype(mx.float32), **tol))
+                if stream == mx.gpu and qL > 8:
+                    # The fused kernels round the same float32 accumulator
+                    self.assertTrue(mx.array_equal(out.astype(dtype), plain))
+
+    def test_sdpa_plain_output_unchanged(self):
+        # Asking for the lse elsewhere must not change the plain function: it
+        # returns the input type and the same values with or without sinks,
+        # masks and head dims.
+        mx.random.seed(0)
+        sdpa = mx.fast.scaled_dot_product_attention
+        for dtype, D, mask in product(
+            [mx.float16, mx.bfloat16], [64, 128, 256], [None, "causal"]
+        ):
+            with self.subTest(dtype=dtype, D=D, mask=mask):
+                q = mx.random.normal((1, 8, 64, D)).astype(dtype)
+                k = mx.random.normal((1, 2, 128, D)).astype(dtype)
+                v = mx.random.normal((1, 2, 128, D)).astype(dtype)
+                a = sdpa(q, k, v, scale=D**-0.5, mask=mask)
+                mx.fast.scaled_dot_product_attention_with_lse(
+                    q, k, v, scale=D**-0.5, mask=mask
+                )
+                b = sdpa(q, k, v, scale=D**-0.5, mask=mask)
+                self.assertEqual(a.dtype, dtype)
+                self.assertTrue(mx.array_equal(a, b))
+                ref = mlx_ref_attn(q, k, v, D**-0.5, mask)
+                self.assertTrue(mx.allclose(a, ref, atol=5e-2, rtol=5e-2))
+
+    def test_sdpa_with_lse_causal_long_queries(self):
+        # With more queries than keys the first rows have no key to attend to
+        mx.random.seed(0)
+        sdpa_lse = mx.fast.scaled_dot_product_attention_with_lse
+        for sinks in [None, mx.random.normal((4,))]:
+            for qL, kL in [(40, 24), (9, 1)]:
+                q = mx.random.normal((1, 4, qL, 64))
+                k = mx.random.normal((1, 4, kL, 64))
+                v = mx.random.normal((1, 4, kL, 64))
+                _, lse = sdpa_lse(q, k, v, scale=0.125, mask="causal", sinks=sinks)
+                lse_ref = mlx_ref_lse(q, k, 0.125, "causal", sinks)
+                self.assertFalse(mx.any(mx.isnan(lse)).item())
+                self.assertTrue(mx.allclose(lse, lse_ref, atol=1e-4, rtol=1e-4))
+                if sinks is None:
+                    n_empty = qL - kL
+                    self.assertTrue(mx.all(lse[:, :, :n_empty] == -float("inf")))
+                    self.assertTrue(mx.all(mx.isfinite(lse[:, :, n_empty:])))
+
+    def test_sdpa_with_lse_fully_masked_rows(self):
+        mx.random.seed(0)
+        sdpa_lse = mx.fast.scaled_dot_product_attention_with_lse
+        inf = float("inf")
+        for qL in [1, 8, 9, 32]:
+            for kind in ["bool", "additive"]:
+                for use_sinks in [False, True]:
+                    with self.subTest(qL=qL, mask=kind, sinks=use_sinks):
+                        q = mx.random.normal((1, 4, qL, 128))
+                        k = mx.random.normal((1, 4, 40, 128))
+                        v = mx.random.normal((1, 4, 40, 128))
+                        sinks = mx.random.normal((4,)) if use_sinks else None
+                        # The last query of the first head sees nothing
+                        keep = mx.ones((1, 4, qL, 40), dtype=mx.bool_)
+                        keep[:, 0, -1, :] = False
+                        if kind == "bool":
+                            mask = keep
+                        else:
+                            mask = mx.where(keep, 0.0, -inf)
+                        out, lse = sdpa_lse(q, k, v, scale=0.1, mask=mask, sinks=sinks)
+                        lse_ref = mlx_ref_lse(q, k, 0.1, mask, sinks)
+                        self.assertFalse(mx.any(mx.isnan(lse)).item())
+                        self.assertTrue(mx.allclose(lse, lse_ref, atol=1e-4, rtol=1e-4))
+                        if use_sinks:
+                            # Only the sink is left
+                            self.assertAlmostEqual(
+                                lse[0, 0, -1, 0].item(), sinks[0].item(), places=5
+                            )
+                            self.assertTrue(mx.all(mx.isfinite(out)).item())
+                        else:
+                            self.assertEqual(lse[0, 0, -1, 0].item(), -inf)
+                            self.assertTrue(mx.all(mx.isfinite(lse[:, 1:])).item())
+
+    def test_sdpa_with_lse_noncontiguous(self):
+        mx.random.seed(0)
+        sdpa_lse = mx.fast.scaled_dot_product_attention_with_lse
+        for qL, D in product([5, 40], [64, 128]):
+            with self.subTest(qL=qL, D=D):
+                # Inputs laid out as [B, T, N, D] and transposed
+                q = mx.random.normal((2, qL, 8, D)).transpose(0, 2, 1, 3)
+                k = mx.random.normal((2, 100, 2, D)).transpose(0, 2, 1, 3)
+                v = mx.random.normal((2, 100, 2, D)).transpose(0, 2, 1, 3)
+                # Keys and values sliced from a larger cache
+                k_cache = mx.random.normal((2, 2, 128, D))
+                v_cache = mx.random.normal((2, 2, 128, D))
+                for kk, vv in [(k, v), (k_cache[:, :, :70], v_cache[:, :, :70])]:
+                    out, lse = sdpa_lse(q, kk, vv, scale=0.1, mask="causal")
+                    out_c, lse_c = sdpa_lse(
+                        mx.contiguous(q),
+                        mx.contiguous(kk),
+                        mx.contiguous(vv),
+                        scale=0.1,
+                        mask="causal",
+                    )
+                    self.assertTrue(mx.allclose(out, out_c, atol=1e-5, rtol=1e-5))
+                    self.assertTrue(mx.allclose(lse, lse_c, atol=1e-5, rtol=1e-5))
+                    ref = mlx_ref_lse(q, kk, 0.1, "causal")
+                    self.assertTrue(mx.allclose(lse, ref, atol=1e-4, rtol=1e-4))
+
+    def test_sdpa_with_lse_cpu(self):
+        mx.random.seed(0)
+        sdpa_lse = mx.fast.scaled_dot_product_attention_with_lse
+        q = mx.random.normal((1, 8, 20, 64))
+        k = mx.random.normal((1, 2, 50, 64))
+        v = mx.random.normal((1, 2, 50, 64))
+        sinks = mx.random.normal((8,))
+        for mask in [None, "causal"]:
+            out, lse = sdpa_lse(
+                q, k, v, scale=0.125, mask=mask, sinks=sinks, stream=mx.cpu
+            )
+            self.assertEqual(lse.dtype, mx.float32)
+            self.assertEqual(lse.shape, (1, 8, 20, 1))
+            self.assertTrue(
+                mx.allclose(lse, mlx_ref_lse(q, k, 0.125, mask, sinks), atol=1e-5)
+            )
+            out_ref = mlx_ref_attn(q, k, v, 0.125, mask, sinks)
+            self.assertTrue(mx.allclose(out, out_ref, atol=1e-5, rtol=1e-5))
+        if mx.default_device() == mx.gpu:
+            with self.assertRaises(ValueError):
+                sdpa_lse(q, k, v, scale=0.125, force_fused=True, stream=mx.cpu)
+
+    def test_sdpa_with_lse_vector(self):
+        # No vector kernel writes the lse: it is computed by the fallback
+        mx.random.seed(0)
+        sdpa_lse = mx.fast.scaled_dot_product_attention_with_lse
+        for qL, D in product([1, 4, 8], [64, 128, 192]):
+            with self.subTest(qL=qL, D=D):
+                q = mx.random.normal((1, 8, qL, D))
+                k = mx.random.normal((1, 2, 300, D))
+                v = mx.random.normal((1, 2, 300, D))
+                mask = mx.random.uniform(shape=(1, 1, qL, 300)) < 0.5
+                mask[..., 0] = True
+                for m in [None, "causal", mask]:
+                    out, lse = sdpa_lse(q, k, v, scale=D**-0.5, mask=m)
+                    ref = mlx_ref_lse(q, k, D**-0.5, m)
+                    self.assertTrue(mx.allclose(lse, ref, atol=1e-4, rtol=1e-4))
+                    out_ref = mlx_ref_attn(q, k, v, D**-0.5, m)
+                    self.assertTrue(mx.allclose(out, out_ref, atol=1e-4, rtol=1e-4))
+                if mx.default_device() == mx.gpu:
+                    with self.assertRaises(ValueError):
+                        sdpa_lse(q, k, v, scale=D**-0.5, force_fused=True)
+
+    def test_sdpa_with_lse_force_fused(self):
+        if mx.default_device() != mx.gpu:
+            self.skipTest("requires GPU")
+        mx.random.seed(0)
+        q = mx.random.normal((1, 8, 64, 64))
+        k = mx.random.normal((1, 2, 128, 64))
+        v = mx.random.normal((1, 2, 128, 64))
+        mask = mx.random.uniform(shape=(1, 1, 64, 128)) < 0.5
+        mask[..., 0] = True
+        for m in [None, "causal", mask]:
+            out, lse = mx.fast.scaled_dot_product_attention_with_lse(
+                q, k, v, scale=0.125, mask=m, force_fused=True
+            )
+            self.assertTrue(
+                mx.allclose(lse, mlx_ref_lse(q, k, 0.125, m), atol=1e-4, rtol=1e-4)
+            )
+        # The lse is not written for the fused kernels under differentiation
+        with self.assertRaises(ValueError):
+            mx.grad(
+                lambda q: sum(
+                    x.sum()
+                    for x in mx.fast.scaled_dot_product_attention_with_lse(
+                        q, k, v, scale=0.125, force_fused=True
+                    )
+                )
+            )(q)
+
+    def test_sdpa_with_lse_grad(self):
+        mx.random.seed(0)
+        sdpa_lse = mx.fast.scaled_dot_product_attention_with_lse
+        weights = mx.random.normal((1, 8, 40, 1))
+        cot = mx.random.normal((1, 8, 40, 64))
+        mask = mx.random.uniform(shape=(1, 1, 40, 70)) < 0.6
+        mask[..., 0] = True
+
+        for m, use_sinks, (qL, kL) in product(
+            [None, "causal", mask], [False, True], [(40, 70), (7, 70)]
+        ):
+            with self.subTest(mask=type(m).__name__, sinks=use_sinks):
+                q = mx.random.normal((1, 8, qL, 64))
+                k = mx.random.normal((1, 2, kL, 64))
+                v = mx.random.normal((1, 2, kL, 64))
+                sinks = mx.random.normal((8,)) if use_sinks else None
+                mm = m[..., :qL, :kL] if isinstance(m, mx.array) else m
+                w, c = weights[:, :, :qL], cot[:, :, :qL]
+
+                def fast(q, k, v):
+                    o, lse = sdpa_lse(q, k, v, scale=0.125, mask=mm, sinks=sinks)
+                    return (o * c).sum() + (lse * w).sum()
+
+                def ref(q, k, v):
+                    o = mlx_ref_attn(q, k, v, 0.125, mm, sinks)
+                    lse = mlx_ref_lse(q, k, 0.125, mm, sinks)
+                    return (o * c).sum() + (lse * w).sum()
+
+                g_fast = mx.grad(fast, argnums=(0, 1, 2))(q, k, v)
+                g_ref = mx.grad(ref, argnums=(0, 1, 2))(q, k, v)
+                for gf, gr in zip(g_fast, g_ref):
+                    self.assertTrue(mx.allclose(gf, gr, atol=1e-4, rtol=1e-4))
+
+                # A cotangent for the lse only must not be dropped
+                def fast_lse(q, k, v):
+                    return sdpa_lse(q, k, v, scale=0.125, mask=mm, sinks=sinks)[1].sum()
+
+                gq = mx.grad(fast_lse)(q, k, v)
+                self.assertGreater(mx.abs(gq).max().item(), 1e-3)
+                gq_ref = mx.grad(lambda q: mlx_ref_lse(q, k, 0.125, mm, sinks).sum())(q)
+                self.assertTrue(mx.allclose(gq, gq_ref, atol=1e-4, rtol=1e-4))
+
+    def test_sdpa_with_lse_merge_chunks(self):
+        # The use case: attention over separate sets of keys and values, e.g.
+        # a prefix shared between sequences or a segmented kv cache.
+        mx.random.seed(0)
+        sdpa_lse = mx.fast.scaled_dot_product_attention_with_lse
+        for dtype in [mx.float32, mx.float16, mx.bfloat16]:
+            for D, qL, use_sinks, mask_kind in product(
+                [64, 128, 256], [1, 12, 64], [False, True], [None, "bool"]
+            ):
+                with self.subTest(
+                    dtype=dtype, D=D, qL=qL, sinks=use_sinks, mask=mask_kind
+                ):
+                    kL = 200
+                    q = mx.random.normal((2, 8, qL, D)).astype(dtype)
+                    k = mx.random.normal((2, 2, kL, D)).astype(dtype)
+                    v = mx.random.normal((2, 2, kL, D)).astype(dtype)
+                    sinks = mx.random.normal((8,)).astype(dtype) if use_sinks else None
+                    scale = D**-0.5
+                    mask = None
+                    if mask_kind:
+                        mask = mx.random.uniform(shape=(2, 1, qL, kL)) < 0.5
+                        mask[..., 0] = True
+                        # Rows without keys in the second chunk
+                        mask[:, :, 0, 100:] = False
+
+                    # The reference is float32 attention on the same inputs
+                    ref = mlx_ref_attn(
+                        q.astype(mx.float32),
+                        k.astype(mx.float32),
+                        v.astype(mx.float32),
+                        scale,
+                        mask,
+                        None if sinks is None else sinks.astype(mx.float32),
+                    )
+                    atol = _f32_out_atol(qL, D)
+
+                    # Two chunks at an arbitrary boundary. The sinks are one
+                    # more key and belong to a single chunk.
+                    for split in [1, 37, 100, 199]:
+                        sl_1 = slice(0, split)
+                        sl_2 = slice(split, kL)
+                        m_1 = None if mask is None else mask[..., sl_1]
+                        m_2 = None if mask is None else mask[..., sl_2]
+                        o_1, lse_1 = sdpa_lse(
+                            q, k[:, :, sl_1], v[:, :, sl_1], scale=scale,
+                            mask=m_1, sinks=sinks,
+                        )  # fmt: skip
+                        o_2, lse_2 = sdpa_lse(
+                            q, k[:, :, sl_2], v[:, :, sl_2], scale=scale, mask=m_2
+                        )
+                        self.assertEqual(o_1.dtype, mx.float32)
+                        o, lse = merge_attention(o_1, lse_1, o_2, lse_2)
+                        # Nothing was rounded: the merge matches float32
+                        self.assertTrue(mx.allclose(o, ref, atol=atol, rtol=1e-4))
+                        # A single rounding at the end differs from the rounded
+                        # reference in a few elements at most, rounding the
+                        # chunks first as well in many more. Only where the
+                        # kernel is exact: the NAX kernels' own error is above
+                        # the rounding of half precision.
+                        if dtype != mx.float32 and atol < 1e-3:
+                            ref_r = ref.astype(dtype)
+                            once = (o.astype(dtype) != ref_r).astype(mx.float32).mean()
+                            o_r, _ = merge_attention(
+                                o_1.astype(dtype), lse_1, o_2.astype(dtype), lse_2
+                            )
+                            twice = (
+                                (o_r.astype(dtype) != ref_r).astype(mx.float32).mean()
+                            )
+                            self.assertLess(once.item(), 0.05)
+                            self.assertLessEqual(once.item(), twice.item())
+                        lse_ref = mlx_ref_lse(q, k, scale, mask, sinks)
+                        self.assertTrue(mx.allclose(lse, lse_ref, atol=1e-3, rtol=1e-3))
+
+    def test_sdpa_with_lse_merge_causal_chunks(self):
+        # Causal attention over a cache split in a prefix and a new segment
+        mx.random.seed(0)
+        sdpa_lse = mx.fast.scaled_dot_product_attention_with_lse
+        prefix, new, D = 150, 50, 128
+        q = mx.random.normal((1, 8, new, D))
+        k = mx.random.normal((1, 8, prefix + new, D))
+        v = mx.random.normal((1, 8, prefix + new, D))
+        ref = mlx_ref_attn(q, k, v, D**-0.5, "causal")
+        # Every query attends to the whole prefix, the new segment is causal
+        o_1, lse_1 = sdpa_lse(q, k[:, :, :prefix], v[:, :, :prefix], scale=D**-0.5)
+        o_2, lse_2 = sdpa_lse(
+            q, k[:, :, prefix:], v[:, :, prefix:], scale=D**-0.5, mask="causal"
+        )
+        o, _ = merge_attention(o_1, lse_1, o_2, lse_2)
+        self.assertTrue(mx.allclose(o, ref, atol=1e-5, rtol=1e-4))
+
+        # The first query of a later chunk of a ring has nothing to attend to
+        # in a chunk of future keys: its lse is -inf and drops out of the merge
+        o_f, lse_f = sdpa_lse(
+            q,
+            k[:, :, prefix:],
+            v[:, :, prefix:],
+            scale=D**-0.5,
+            mask=mx.tril(mx.ones((new, new), dtype=mx.bool_), k=-1),
+        )
+        self.assertEqual(lse_f[0, 0, 0, 0].item(), -float("inf"))
+        o, lse = merge_attention(o_1, lse_1, o_f, lse_f)
+        self.assertFalse(mx.any(mx.isnan(o)).item())
+        self.assertTrue(mx.allclose(o[:, :, 0], o_1[:, :, 0], atol=1e-5, rtol=1e-4))
 
 
 if __name__ == "__main__":

@@ -60,6 +60,32 @@ MLX_API array scaled_dot_product_attention(
     bool force_fused = false,
     StreamOrDevice s = {});
 
+/**
+ * Same as `scaled_dot_product_attention` but also returns the natural
+ * logarithm of the softmax normalizer, `logsumexp(scale * Q @ K.T + mask)`
+ * (including the sinks) over the key axis. It is computed in float32 and has
+ * shape [B, N_q, T_q, 1]. Rows without any unmasked key (and without sinks)
+ * have a logsumexp of -inf.
+ *
+ * Together with the output it allows to combine the attention over separate
+ * sets of keys and values exactly. For that reason the output is float32 as
+ * well for half precision inputs (not rounded to the input type, so that the
+ * result of a combination is rounded once); float32 inputs are unchanged.
+ * The fused kernels write the logsumexp for T_q > 8; otherwise it is computed
+ * by the fallback. If the result is differentiated the fallback is used as
+ * well.
+ */
+MLX_API std::pair<array, array> scaled_dot_product_attention_with_lse(
+    const array& queries,
+    const array& keys,
+    const array& values,
+    const float scale,
+    const std::string& mask_mode = "",
+    std::optional<array> mask_arr = {},
+    const std::optional<array>& sinks = {},
+    bool force_fused = false,
+    StreamOrDevice s = {});
+
 MLX_API std::vector<array> gated_delta_update(
     const array& queries,
     const array& keys,

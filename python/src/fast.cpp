@@ -114,6 +114,57 @@ mx::CompileOptions parse_compile_options(const nb::object& obj) {
 
 } // namespace
 
+namespace {
+
+// Binds a scaled_dot_product_attention variant, parsing the mask argument.
+template <typename Fn>
+auto sdpa_binding(Fn fn) {
+  return [fn](
+             const mx::array& queries,
+             const mx::array& keys,
+             const mx::array& values,
+             const float scale,
+             const std::variant<std::monostate, std::string, mx::array>& mask,
+             const std::optional<mx::array>& sinks,
+             bool force_fused,
+             mx::StreamOrDevice s) {
+    if (std::holds_alternative<std::string>(mask)) {
+      auto mask_str = std::get<std::string>(mask);
+      if (mask_str != "causal") {
+        std::ostringstream msg;
+        msg << "[scaled_dot_product_attention] invalid mask option '"
+            << mask_str << "'. Must be 'causal', or an array.";
+        throw std::invalid_argument(msg.str());
+      }
+      return fn(
+          queries,
+          keys,
+          values,
+          scale,
+          mask_str,
+          std::nullopt,
+          sinks,
+          force_fused,
+          s);
+    } else if (std::holds_alternative<mx::array>(mask)) {
+      return fn(
+          queries,
+          keys,
+          values,
+          scale,
+          "",
+          std::get<mx::array>(mask),
+          sinks,
+          force_fused,
+          s);
+    }
+    return fn(
+        queries, keys, values, scale, "", std::nullopt, sinks, force_fused, s);
+  };
+}
+
+} // namespace
+
 void init_fast(nb::module_& parent_module) {
   auto m =
       parent_module.def_submodule("fast", "mlx.core.fast: fast operations");
@@ -258,57 +309,7 @@ void init_fast(nb::module_& parent_module) {
 
   m.def(
       "scaled_dot_product_attention",
-      [](const mx::array& queries,
-         const mx::array& keys,
-         const mx::array& values,
-         const float scale,
-         const std::variant<std::monostate, std::string, mx::array>& mask,
-         const std::optional<mx::array>& sinks,
-         bool force_fused,
-         mx::StreamOrDevice s) {
-        bool has_mask = !std::holds_alternative<std::monostate>(mask);
-        bool has_str_mask =
-            has_mask && std::holds_alternative<std::string>(mask);
-        bool has_arr_mask = has_mask && std::holds_alternative<mx::array>(mask);
-
-        if (has_mask) {
-          if (has_str_mask) {
-            auto mask_str = std::get<std::string>(mask);
-            if (mask_str != "causal") {
-              std::ostringstream msg;
-              msg << "[scaled_dot_product_attention] invalid mask option '"
-                  << mask_str << "'. Must be 'causal', or an array.";
-              throw std::invalid_argument(msg.str());
-            }
-            return mx::fast::scaled_dot_product_attention(
-                queries,
-                keys,
-                values,
-                scale,
-                mask_str,
-                std::nullopt,
-                sinks,
-                force_fused,
-                s);
-          } else {
-            auto mask_arr = std::get<mx::array>(mask);
-            return mx::fast::scaled_dot_product_attention(
-                queries,
-                keys,
-                values,
-                scale,
-                "",
-                mask_arr,
-                sinks,
-                force_fused,
-                s);
-          }
-
-        } else {
-          return mx::fast::scaled_dot_product_attention(
-              queries, keys, values, scale, "", {}, sinks, force_fused, s);
-        }
-      },
+      sdpa_binding(&mx::fast::scaled_dot_product_attention),
       "q"_a,
       "k"_a,
       "v"_a,
@@ -384,6 +385,69 @@ void init_fast(nb::module_& parent_module) {
             v = mx.random.normal(shape=(B, N_kv, T_kv, D))
             scale = D ** -0.5
             out = mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask="causal")
+      )pbdoc");
+
+  m.def(
+      "scaled_dot_product_attention_with_lse",
+      sdpa_binding(&mx::fast::scaled_dot_product_attention_with_lse),
+      "q"_a,
+      "k"_a,
+      "v"_a,
+      nb::kw_only(),
+      "scale"_a,
+      "mask"_a = nb::none(),
+      "sinks"_a = nb::none(),
+      "force_fused"_a = false,
+      "stream"_a = nb::none(),
+      nb::sig(
+          "def scaled_dot_product_attention_with_lse(q: array, k: array, v: array, *, scale: float,  mask: None | str | array = None, sinks: array | None = None, force_fused: bool = False, stream: StreamOrDevice = None) -> tuple[array, array]"),
+      R"pbdoc(
+        Like :func:`scaled_dot_product_attention` but also return the
+        log-sum-exp of the attention scores.
+
+        Both outputs are ``float32`` for ``float16`` and ``bfloat16`` inputs,
+        because this function exists to combine the attention over separate
+        sets of keys and values exactly: an output rounded to the input type
+        before the combination would be rounded twice. Cast the result with
+        ``.astype`` if the input type is needed. For ``float32`` inputs
+        nothing changes. :func:`scaled_dot_product_attention` itself is
+        unaffected.
+
+        The log-sum-exp is the natural logarithm of the softmax normalizer,
+        ``log(sum(exp(scale * q @ k.T + mask), axis=-1))``, computed in
+        ``float32``. The attention sinks, if given, are part of the sum. It
+        has shape ``[B, N_q, T_q, 1]``, so it broadcasts against the output.
+
+        Together with the output it allows to combine the attention over
+        separate sets of keys and values exactly. With ``(o_1, lse_1)`` and
+        ``(o_2, lse_2)`` computed for two chunks of the keys and values, the
+        result for all the keys and values is
+
+        .. code-block:: python
+
+          lse = mx.logaddexp(lse_1, lse_2)
+          o = mx.exp(lse_1 - lse) * o_1 + mx.exp(lse_2 - lse) * o_2
+
+        .. note::
+
+          * A row of ``q`` for which all keys are masked out (and without
+            sinks) has a log-sum-exp of ``-inf``. Combining such a row with
+            another one for which it is also ``-inf`` yields ``nan`` with the
+            formula above and should be guarded against. The output of such
+            a row is unspecified.
+          * The fused kernels write the log-sum-exp for ``T_q > 8`` and the
+            fallback computes it otherwise. With ``force_fused=True`` an error
+            is raised for ``T_q <= 8``, where no fused kernel is available.
+          * When differentiating through the call, the unfused implementation
+            is used so that the gradient also accounts for the log-sum-exp.
+            ``force_fused=True`` is not supported in that case.
+
+        See :func:`scaled_dot_product_attention` for the arguments.
+
+        Returns:
+            tuple(array, array): The output with shape ``[B, N_q, T_q, D]``
+            and the log-sum-exp with shape ``[B, N_q, T_q, 1]``, both
+            ``float32`` for half precision inputs.
       )pbdoc");
 
   m.def(
