@@ -723,6 +723,7 @@ std::vector<array> sdpa_impl(
     const std::optional<array>& sinks,
     bool force_fused,
     bool return_lse,
+    bool float32_output,
     StreamOrDevice s) {
   for (const auto& tensor : {queries, keys, values}) {
     if (tensor.ndim() != 4) {
@@ -814,6 +815,9 @@ std::vector<array> sdpa_impl(
     throw std::invalid_argument(msg.str());
   }
   bool has_sinks = sinks.has_value();
+  // Only half precision inputs need a separate float32 output.
+  float32_output = float32_output && final_type != float32;
+  auto out_type = float32_output ? float32 : final_type;
 
   auto q = astype(queries, final_type, s);
   auto k = astype(keys, final_type, s);
@@ -826,11 +830,16 @@ std::vector<array> sdpa_impl(
                    has_sinks,
                    has_arr_mask,
                    return_lse,
+                   float32_output,
                    s](const std::vector<array>& inputs) {
-    auto q = multiply(array(scale, inputs[0].dtype()), inputs[0], s);
+    // With float32_output the scale, scores, softmax and output are float32,
+    // so neither the scaled queries nor the output are rounded.
+    auto q = float32_output
+        ? multiply(array(scale, float32), astype(inputs[0], float32, s), s)
+        : multiply(array(scale, inputs[0].dtype()), inputs[0], s);
     int n_repeats = n_q_heads / n_kv_heads;
-    auto k = inputs[1];
-    auto v = inputs[2];
+    auto k = float32_output ? astype(inputs[1], float32, s) : inputs[1];
+    auto v = float32_output ? astype(inputs[2], float32, s) : inputs[2];
     if (n_repeats > 1) {
       q = unflatten(q, 1, {n_kv_heads, n_repeats}, s);
       k = expand_dims(k, 2, s);
@@ -870,6 +879,9 @@ std::vector<array> sdpa_impl(
     }
     if (has_sinks) {
       auto sinks = inputs.back();
+      if (float32_output) {
+        sinks = astype(sinks, float32, s);
+      }
       // scores has shape B N_q N_k L_q L_k
       sinks = expand_dims(sinks, {0, 2, 3}, s);
       if (scores.ndim() == 5) {
@@ -970,11 +982,12 @@ std::vector<array> sdpa_impl(
         do_causal,
         has_sinks,
         output_logsumexp,
-        force_fused);
+        force_fused,
+        float32_output);
     if (output_logsumexp) {
       return array::make_arrays(
           {std::move(out_shape), Shape{q.shape(0), q.shape(1), q.shape(2), 1}},
-          {final_type, float32},
+          {out_type, float32},
           primitive,
           std::move(inputs));
     } else {
@@ -1008,6 +1021,7 @@ array scaled_dot_product_attention(
       sinks,
       force_fused,
       /* return_lse = */ false,
+      /* float32_output = */ false,
       s)[0];
 }
 
@@ -1021,6 +1035,7 @@ std::pair<array, array> scaled_dot_product_attention_lse(
     std::optional<array> mask_arr /* = {} */,
     const std::optional<array>& sinks /* = {} */,
     bool force_fused /* = false */,
+    bool float32_output /* = false */,
     StreamOrDevice s /* = {} */) {
   auto outputs = sdpa_impl(
       queries,
@@ -1032,6 +1047,7 @@ std::pair<array, array> scaled_dot_product_attention_lse(
       sinks,
       force_fused,
       /* return_lse = */ true,
+      float32_output,
       s);
   return {std::move(outputs[0]), std::move(outputs[1])};
 }
@@ -1087,7 +1103,8 @@ bool ScaledDotProductAttention::is_equivalent(const Primitive& other) const {
   return scale_ == a_other.scale_ && do_causal_ == a_other.do_causal_ &&
       has_sinks_ == a_other.has_sinks_ &&
       output_logsumexp_ == a_other.output_logsumexp_ &&
-      force_fused_ == a_other.force_fused_;
+      force_fused_ == a_other.force_fused_ &&
+      float32_output_ == a_other.float32_output_;
 }
 
 bool ScaledDotProductAttentionVJP::is_equivalent(const Primitive& other) const {

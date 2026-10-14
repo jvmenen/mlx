@@ -82,6 +82,9 @@ void sdpa_full_self_attention_nax(
   const bool do_causal = do_causal_;
   const bool has_sinks = sinks.has_value();
   const bool output_lse = lse != nullptr;
+  // The fused LSE route can write the output in float32 for half precision
+  // inputs (fast::scaled_dot_product_attention_lse with float32_output).
+  const bool output_f32 = o.dtype() == float32 && q.dtype() != float32;
 
   metal::MTLFCList func_consts = {
       {&align_Q, MTL::DataType::DataTypeBool, 200},
@@ -89,7 +92,8 @@ void sdpa_full_self_attention_nax(
       {&has_mask, MTL::DataType::DataTypeBool, 300},
       {&do_causal, MTL::DataType::DataTypeBool, 301},
       {&has_sinks, MTL::DataType::DataTypeBool, 302},
-      {&output_lse, MTL::DataType::DataTypeBool, 303}};
+      {&output_lse, MTL::DataType::DataTypeBool, 303},
+      {&output_f32, MTL::DataType::DataTypeBool, 304}};
 
   std::string base_name;
   concatenate(
@@ -126,7 +130,9 @@ void sdpa_full_self_attention_nax(
       "_has_sinks_",
       (has_sinks ? 't' : 'n'),
       "_output_lse_",
-      (output_lse ? 't' : 'n'));
+      (output_lse ? 't' : 'n'),
+      "_output_f32_",
+      (output_f32 ? 't' : 'n'));
 
   auto& compute_encoder = metal::get_command_encoder(s);
 
@@ -335,6 +341,9 @@ void sdpa_full_self_attention_metal(
   const bool do_causal = do_causal_;
   const bool has_sinks = sinks.has_value();
   const bool output_lse = lse != nullptr;
+  // The fused LSE route can write the output in float32 for half precision
+  // inputs (fast::scaled_dot_product_attention_lse with float32_output).
+  const bool output_f32 = o.dtype() == float32 && q.dtype() != float32;
 
   metal::MTLFCList func_consts = {
       {&align_Q, MTL::DataType::DataTypeBool, 200},
@@ -342,7 +351,8 @@ void sdpa_full_self_attention_metal(
       {&has_mask, MTL::DataType::DataTypeBool, 300},
       {&do_causal, MTL::DataType::DataTypeBool, 301},
       {&has_sinks, MTL::DataType::DataTypeBool, 302},
-      {&output_lse, MTL::DataType::DataTypeBool, 303}};
+      {&output_lse, MTL::DataType::DataTypeBool, 303},
+      {&output_f32, MTL::DataType::DataTypeBool, 304}};
 
   std::string base_name;
   concatenate(
@@ -379,7 +389,9 @@ void sdpa_full_self_attention_metal(
       "_has_sinks_",
       (has_sinks ? 't' : 'n'),
       "_output_lse_",
-      (output_lse ? 't' : 'n'));
+      (output_lse ? 't' : 'n'),
+      "_output_f32_",
+      (output_f32 ? 't' : 'n'));
 
   auto& compute_encoder = metal::get_command_encoder(s);
 

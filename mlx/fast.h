@@ -71,7 +71,9 @@ MLX_API std::vector<array> gated_delta_update(
     StreamOrDevice s = {});
 
 /** Computes: O = softmax(Q @ K.T) @ V and the row-wise logsumexp of the
- * scaled (and masked) scores, shape [B, N_q, T_q, 1] in float32. **/
+ * scaled (and masked) scores, shape [B, N_q, T_q, 1] in float32. With
+ * `float32_output` the output O is float32 as well (unrounded), so that
+ * attention over separate sets of keys can be merged and rounded once. **/
 MLX_API std::pair<array, array> scaled_dot_product_attention_lse(
     const array& queries,
     const array& keys,
@@ -81,6 +83,7 @@ MLX_API std::pair<array, array> scaled_dot_product_attention_lse(
     std::optional<array> mask_arr = {},
     const std::optional<array>& sinks = {},
     bool force_fused = false,
+    bool float32_output = false,
     StreamOrDevice s = {});
 
 using TemplateArg = std::variant<int, bool, Dtype>;

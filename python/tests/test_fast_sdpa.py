@@ -117,6 +117,17 @@ def mlx_primitives_sdpa(q, k, v, scale, mask=None):
     return scores @ v
 
 
+def _f32_out_tol(qL, D):
+    # Tolerance of the float32 output against a float32 reference. The NAX
+    # full attention kernels (more than 8 queries, head dims 64, 96, 128, 256
+    # and 512) multiply the probabilities into V at reduced precision, about
+    # 1e-3 absolute for unit-normal inputs and well below one bfloat16 ulp;
+    # the other kernels and the fallback are float32 throughout.
+    if qL > 8 and D in (64, 96, 128, 256, 512):
+        return 2e-3
+    return 1e-5
+
+
 class TestFastSDPA(mlx_tests.MLXTestCase):
     @unittest.skipIf(not mx.is_available(mx.gpu), "GPU kernel path only")
     def test_sdpa_head_dim_72(self):
@@ -1523,6 +1534,172 @@ print(json.dumps(res))
             mask=keep,
         )
         self.assertLess(mx.abs(out - ref).max().item(), 2e-2)
+
+    def test_sdpa_with_lse_float32_output(self):
+        # scaled_dot_product_attention_with_lse: the fused kernels store the float32 accumulator
+        # instead of rounding it to the input type: the output equals a
+        # float32 reference within float32 tolerance, rounding it gives the
+        # plain output bit for bit, and the lse is unchanged.
+        def fp32_ref(q, k, v, scale, mask, sinks):
+            q, k, v = (x.astype(mx.float32) for x in (q, k, v))
+            n_rep = q.shape[1] // k.shape[1]
+            k = mx.repeat(k, n_rep, axis=1)
+            v = mx.repeat(v, n_rep, axis=1)
+            scores = (q @ mx.swapaxes(k, -1, -2)) * scale
+            qL, kL = q.shape[2], k.shape[2]
+            if mask == "causal":
+                keep = (mx.arange(qL) + (kL - qL))[:, None] >= mx.arange(kL)[None]
+                scores = mx.where(keep, scores, -mx.inf)
+            elif mask is not None:
+                scores = scores + mask.astype(mx.float32)
+            if sinks is not None:
+                s = mx.broadcast_to(
+                    sinks.astype(mx.float32)[None, :, None, None],
+                    scores.shape[:-1] + (1,),
+                )
+                scores = mx.concatenate([s, scores], axis=-1)
+            lse = mx.logsumexp(scores, axis=-1, keepdims=True)
+            p = mx.exp(scores - lse)
+            if sinks is not None:
+                p = p[..., 1:]
+            return p @ v, lse
+
+        for dtype, D, (qL, kL), mask, sinks in product(
+            (mx.float16, mx.bfloat16),
+            (64, 80, 128, 256),
+            ((1, 70), (4, 70), (40, 40), (100, 300), (130, 130)),
+            (None, "causal", "array"),
+            (False, True),
+        ):
+            if mask == "causal" and qL > kL:
+                continue
+            with self.subTest(dtype=dtype, D=D, qL=qL, kL=kL, mask=mask, sinks=sinks):
+                B, qH, kH = 1, 8, 2
+                q = mx.random.normal((B, qH, qL, D)).astype(dtype)
+                k = mx.random.normal((B, kH, kL, D)).astype(dtype)
+                v = mx.random.normal((B, kH, kL, D)).astype(dtype)
+                snk = mx.random.normal((qH,)).astype(dtype) if sinks else None
+                scale = D**-0.5
+                m = mask
+                if mask == "array":
+                    m = mx.random.normal((B, 1, qL, kL)).astype(dtype)
+                kwargs = dict(scale=scale, mask=m, sinks=snk, return_lse=True)
+
+                out, lse = mx.fast.scaled_dot_product_attention(q, k, v, **kwargs)
+                out32, lse32 = mx.fast.scaled_dot_product_attention_with_lse(
+                    q, k, v, **{x: y for x, y in kwargs.items() if x != "return_lse"}
+                )
+                ref, ref_lse = fp32_ref(q, k, v, scale, m, snk)
+
+                self.assertEqual(out32.dtype, mx.float32)
+                self.assertEqual(out32.shape, out.shape)
+                self.assertEqual(lse32.dtype, mx.float32)
+                err32 = mx.abs(out32 - ref)
+                self.assertLess(err32.max().item(), _f32_out_tol(qL, D))
+                if dtype == mx.bfloat16:
+                    err = mx.abs(out.astype(mx.float32) - ref)
+                    self.assertLess(err32.mean().item(), 0.25 * err.mean().item())
+                if qL > 8:
+                    # Fused kernel: same accumulator, only the store differs.
+                    self.assertTrue(mx.array_equal(out32.astype(dtype), out).item())
+                    self.assertTrue(mx.array_equal(lse32, lse).item())
+                else:
+                    # Fallback: scores in float32 as well, so the lse is exact.
+                    self.assertLess(mx.abs(lse32 - ref_lse).max().item(), 1e-4)
+
+    def test_sdpa_with_lse_float32_output_padded_head_dim(self):
+        # Head dim 80 padded to the NAX kernel: the float32 output survives
+        # the copy back out of the padded buffer.
+        D, qL, kL = 80, 600, 600
+        q = mx.random.normal((1, 4, qL, D)).astype(mx.bfloat16)
+        k = mx.random.normal((1, 4, kL, D)).astype(mx.bfloat16)
+        v = mx.random.normal((1, 4, kL, D)).astype(mx.bfloat16)
+        old = os.environ.get("MLX_SDPA_PAD_HEAD_DIM")
+        try:
+            for pad in ("0", "1"):
+                os.environ["MLX_SDPA_PAD_HEAD_DIM"] = pad
+                out, _ = mx.fast.scaled_dot_product_attention(
+                    q, k, v, scale=D**-0.5, return_lse=True
+                )
+                out32, _ = mx.fast.scaled_dot_product_attention_with_lse(
+                    q, k, v, scale=D**-0.5
+                )
+                ref = mlx_ref_attn(
+                    q.astype(mx.float32),
+                    k.astype(mx.float32),
+                    v.astype(mx.float32),
+                    scale=D**-0.5,
+                )
+                with self.subTest(pad=pad):
+                    self.assertEqual(out32.dtype, mx.float32)
+                    tol = _f32_out_tol(qL, 96 if pad == "1" else D)
+                    self.assertLess(mx.abs(out32 - ref).max().item(), tol)
+                    self.assertTrue(
+                        mx.array_equal(out32.astype(mx.bfloat16), out).item()
+                    )
+        finally:
+            if old is None:
+                os.environ.pop("MLX_SDPA_PAD_HEAD_DIM", None)
+            else:
+                os.environ["MLX_SDPA_PAD_HEAD_DIM"] = old
+
+    def test_sdpa_with_lse_float32_output_merge(self):
+        # Segments merged from float32 outputs and rounded once equal the
+        # float32 attention over all keys rounded once, up to float32 error.
+        D, qH, kH, qL = 128, 8, 2, 64
+        scale = D**-0.5
+        dtype = mx.bfloat16
+        q = mx.random.normal((1, qH, qL, D)).astype(dtype)
+        ks = [mx.random.normal((1, kH, n, D)).astype(dtype) for n in (300, 77)]
+        vs = [mx.random.normal((1, kH, n, D)).astype(dtype) for n in (300, 77)]
+        k_own = mx.random.normal((1, kH, qL, D)).astype(dtype)
+        v_own = mx.random.normal((1, kH, qL, D)).astype(dtype)
+        sdpa_lse = mx.fast.scaled_dot_product_attention_with_lse
+        parts = [sdpa_lse(q, k, v, scale=scale) for k, v in zip(ks, vs)]
+        parts.append(sdpa_lse(q, k_own, v_own, scale=scale, mask="causal"))
+        lses = mx.stack([p[1] for p in parts])
+        total = mx.logsumexp(lses, axis=0)
+        out = sum(mx.exp(l - total) * o for o, l in parts)
+
+        n_old = sum(k.shape[2] for k in ks)
+        keep = mx.concatenate(
+            [mx.ones((qL, n_old), mx.bool_), mx.tril(mx.ones((qL, qL), mx.bool_))],
+            axis=1,
+        )
+        ref = mlx_ref_attn(
+            q.astype(mx.float32),
+            mx.concatenate(ks + [k_own], axis=2).astype(mx.float32),
+            mx.concatenate(vs + [v_own], axis=2).astype(mx.float32),
+            scale=scale,
+            mask=keep,
+        )
+        self.assertEqual(out.dtype, mx.float32)
+        self.assertLess(mx.abs(out - ref).max().item(), _f32_out_tol(qL, D))
+
+    def test_sdpa_with_lse_input_types(self):
+        # float32 inputs: same result as return_lse=True. Half precision: the
+        # output of return_lse=True keeps the input type, the one of
+        # scaled_dot_product_attention_with_lse is float32.
+        q = mx.random.normal((1, 2, 16, 64))
+        a, la = mx.fast.scaled_dot_product_attention_with_lse(q, q, q, scale=1.0)
+        b, lb = mx.fast.scaled_dot_product_attention(
+            q, q, q, scale=1.0, return_lse=True
+        )
+        self.assertEqual(a.dtype, mx.float32)
+        self.assertTrue(mx.array_equal(a, b).item())
+        self.assertTrue(mx.array_equal(la, lb).item())
+        qb = q.astype(mx.bfloat16)
+        c, _ = mx.fast.scaled_dot_product_attention(
+            qb, qb, qb, scale=1.0, return_lse=True
+        )
+        d, ld = mx.fast.scaled_dot_product_attention_with_lse(qb, qb, qb, scale=1.0)
+        self.assertEqual(c.dtype, mx.bfloat16)
+        self.assertEqual(d.dtype, mx.float32)
+        self.assertEqual(ld.dtype, mx.float32)
+        with self.assertRaises(TypeError):
+            mx.fast.scaled_dot_product_attention(
+                q, q, q, scale=1.0, return_lse=True, float32_output=True
+            )
 
     def test_sdpa_sliced(self):
         N = 8

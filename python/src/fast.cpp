@@ -279,6 +279,7 @@ void init_fast(nb::module_& parent_module) {
                 std::move(mask_arr),
                 sinks,
                 force_fused,
+                /* float32_output = */ false,
                 s);
             return nb::make_tuple(std::move(out), std::move(lse));
           }
@@ -384,8 +385,10 @@ void init_fast(nb::module_& parent_module) {
                the output, allows the exact combination of attention over
                separate sets of keys and values. For ``T_q > 8`` the fused
                kernels produce it at almost no extra cost; otherwise it is
-               computed with an additional pass over the scores.
-               Default: ``False``.
+               computed with an additional pass over the scores. The output
+               keeps the input type; see
+               :func:`scaled_dot_product_attention_with_lse` for a
+               ``float32`` output. Default: ``False``.
 
         Returns:
             array or tuple[array, array]: The output array or, if
@@ -405,6 +408,74 @@ void init_fast(nb::module_& parent_module) {
             v = mx.random.normal(shape=(B, N_kv, T_kv, D))
             scale = D ** -0.5
             out = mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask="causal")
+      )pbdoc");
+
+  m.def(
+      "scaled_dot_product_attention_with_lse",
+      [](const mx::array& queries,
+         const mx::array& keys,
+         const mx::array& values,
+         const float scale,
+         const std::variant<std::monostate, std::string, mx::array>& mask,
+         const std::optional<mx::array>& sinks,
+         bool force_fused,
+         mx::StreamOrDevice s) {
+        auto run = [&](const std::string& mask_mode,
+                       std::optional<mx::array> mask_arr) {
+          auto [out, lse] = mx::fast::scaled_dot_product_attention_lse(
+              queries,
+              keys,
+              values,
+              scale,
+              mask_mode,
+              std::move(mask_arr),
+              sinks,
+              force_fused,
+              /* float32_output = */ true,
+              s);
+          return nb::make_tuple(std::move(out), std::move(lse));
+        };
+        if (std::holds_alternative<std::string>(mask)) {
+          auto mask_str = std::get<std::string>(mask);
+          if (mask_str != "causal") {
+            std::ostringstream msg;
+            msg << "[scaled_dot_product_attention_with_lse] invalid mask "
+                << "option '" << mask_str << "'. Must be 'causal', or an "
+                << "array.";
+            throw std::invalid_argument(msg.str());
+          }
+          return run(mask_str, std::nullopt);
+        } else if (std::holds_alternative<mx::array>(mask)) {
+          return run("", std::get<mx::array>(mask));
+        }
+        return run("", std::nullopt);
+      },
+      "q"_a,
+      "k"_a,
+      "v"_a,
+      nb::kw_only(),
+      "scale"_a,
+      "mask"_a = nb::none(),
+      "sinks"_a = nb::none(),
+      "force_fused"_a = false,
+      "stream"_a = nb::none(),
+      nb::sig(
+          "def scaled_dot_product_attention_with_lse(q: array, k: array, v: array, *, scale: float,  mask: None | str | array = None, sinks: array | None = None, force_fused: bool = False, stream: StreamOrDevice = None) -> tuple[array, array]"),
+      R"pbdoc(
+        Like :func:`scaled_dot_product_attention` with ``return_lse=True``, but
+        the output is ``float32`` as well for ``float16`` and ``bfloat16``
+        inputs.
+
+        This function exists to combine the attention over separate sets of
+        keys and values exactly: an output rounded to the input type before
+        the combination would be rounded twice. Cast the result with
+        ``.astype`` if the input type is needed. For ``float32`` inputs nothing
+        changes.
+
+        Returns:
+            tuple(array, array): The output with shape ``[B, N_q, T_q, D]``
+            and the log-sum-exp with shape ``[B, N_q, T_q, 1]``, both
+            ``float32``.
       )pbdoc");
 
   m.def(

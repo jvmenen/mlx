@@ -15,6 +15,7 @@ constant bool has_mask [[function_constant(300)]];
 constant bool do_causal [[function_constant(301)]];
 constant bool has_sinks [[function_constant(302)]];
 constant bool output_lse [[function_constant(303)]];
+constant bool output_f32 [[function_constant(304)]];
 
 struct MaxOp {
   template <typename T>
@@ -101,9 +102,14 @@ template <
   V += tidl.z * params->V_strides[0] + // Batch
       kv_head_idx * params->V_strides[1]; // Head
 
-  O += tidl.z * params->O_strides[0] + // Batch
+  // With output_f32 the output buffer holds float32 elements; O32 addresses
+  // it with the same element offsets as O.
+  device float* O32 = reinterpret_cast<device float*>(O);
+  const ulong o_offset = tidl.z * params->O_strides[0] + // Batch
       tidl.y * params->O_strides[1] + // Head
       tidl.x * BQ * params->O_strides[2]; // Sequence
+  O += o_offset;
+  O32 += o_offset;
 
   if (has_mask) {
     mask += tidl.z * mask_params->M_strides[0] + // Batch
@@ -546,6 +552,7 @@ template <
 
   // Store results
   O += (tm + sm) * params->O_strides[2] + d_half * BVh + sn;
+  O32 += (tm + sm) * params->O_strides[2] + d_half * BVh + sn;
 
   if (!align_Q && int(tid.x) == (params->NQ_aligned)) {
     auto dst_tile_dims = short2(BVh - sn, params->qL_rem - (tm + sm));
@@ -553,8 +560,18 @@ template <
     if (dst_tile_dims.x <= 0 || dst_tile_dims.y <= 0)
       return;
 
-    Otile.template store_safe<T, 1, 1>(O, params->O_strides[2], dst_tile_dims);
+    if (output_f32) {
+      Otile.template store_safe<float, 1, 1>(
+          O32, params->O_strides[2], dst_tile_dims);
+    } else {
+      Otile.template store_safe<T, 1, 1>(
+          O, params->O_strides[2], dst_tile_dims);
+    }
   } else {
-    Otile.template store<T, 1, 1>(O, params->O_strides[2]);
+    if (output_f32) {
+      Otile.template store<float, 1, 1>(O32, params->O_strides[2]);
+    } else {
+      Otile.template store<T, 1, 1>(O, params->O_strides[2]);
+    }
   }
 }
