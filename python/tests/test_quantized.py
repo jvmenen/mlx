@@ -3,6 +3,7 @@
 import math
 import os
 import platform
+import re
 import subprocess
 import unittest
 from itertools import product
@@ -534,6 +535,212 @@ class TestQuantized(mlx_tests.MLXTestCase):
                 self.assertEqual(y_q.shape, y_hat.shape)
                 tol = 1e-3 if dtype == mx.float32 else 1.5e-3
                 self.assertLess((y_q - y_hat).abs().max(), tol)
+
+    @unittest.skipIf(not mx.is_available(mx.gpu), "GPU kernel path only")
+    def test_qmm_large_m(self):
+        # On NAX devices, affine transposed 16-bit qmm with M > 64 and
+        # K % 128 == 0, K >= 512 can use a 128 x 64 x 128 tile instead of
+        # 64 x 64 x 64. K = 192 is a multiple of the 32 and 64 group sizes but
+        # not of 128 and K = 128 is short: both keep the default tile. N = 200
+        # leaves a partial N tile, M = 65 and M = 4097 a partial M tile.
+        # Batched weights keep the product on the plain qmm kernel (a single
+        # product of this size may use split-K).
+        key = mx.random.key(0)
+        k1, k2 = mx.random.split(key)
+        tests = product(
+            [mx.float16, mx.bfloat16],  # dtype
+            [32, 64, 128],  # group_size
+            [1, 2, 3, 4, 5, 6, 8],  # bits
+            [65, 128, 1024, 4097],  # M
+            [192, 200],  # N
+            [128, 512, 1024, 192],  # K
+        )
+        for dtype, group_size, bits, M, N, K in tests:
+            if K % group_size != 0:
+                continue
+            if bits == 1 and mx.cuda.is_available():
+                continue
+            with self.subTest(
+                dtype=dtype, shape=(M, N, K), group_size=group_size, bits=bits
+            ):
+                x = (mx.random.normal(shape=(2, M, K), key=k1) / K**0.5).astype(dtype)
+                w = (mx.random.normal(shape=(2, N, K), key=k2) / K**0.5).astype(dtype)
+                w_q, scales, biases = mx.quantize(w, group_size, bits)
+                w_hat = mx.dequantize(w_q, scales, biases, group_size, bits)
+                y_q = mx.quantized_matmul(
+                    x, w_q, scales, biases, True, group_size, bits
+                )
+                y_hat = x.astype(mx.float32) @ w_hat.astype(mx.float32).swapaxes(-1, -2)
+                self.assertEqual(y_q.shape, y_hat.shape)
+                tol = 1.5e-3 if dtype == mx.float16 else 1.5e-2
+                self.assertLess((y_q.astype(mx.float32) - y_hat).abs().max(), tol)
+
+        # Single weight matrix, x with leading batch dimension
+        group_size, bits, N, K = 64, 4, 2056, 1024
+        for dtype, M in product([mx.float16, mx.bfloat16], [65, 300]):
+            with self.subTest(dtype=dtype, shape=(2, M, N, K)):
+                x = (mx.random.normal(shape=(2, M, K), key=k1) / K**0.5).astype(dtype)
+                w = (mx.random.normal(shape=(N, K), key=k2) / K**0.5).astype(dtype)
+                w_q, scales, biases = mx.quantize(w, group_size, bits)
+                w_hat = mx.dequantize(w_q, scales, biases, group_size, bits)
+                y_q = mx.quantized_matmul(
+                    x, w_q, scales, biases, True, group_size, bits
+                )
+                y_hat = x.astype(mx.float32) @ w_hat.astype(mx.float32).T
+                tol = 1.5e-3 if dtype == mx.float16 else 1.5e-2
+                self.assertLess((y_q.astype(mx.float32) - y_hat).abs().max(), tol)
+
+    @unittest.skipIf(not mx.metal.is_available(), "Metal is not available")
+    def test_qmm_large_m_kernels_instantiated(self):
+        # The large-M tile is a separate set of precompiled kernels. The output
+        # is bit-identical to the default tile, so the numerical tests cannot
+        # tell which one ran; this checks that the kernels the dispatch asks
+        # for exist in the metallib, and that float32 (which does not fit the
+        # tile) has none. Python has no hook to see which kernel was
+        # dispatched.
+        arch = mx.device_info()["architecture"]
+        gen = re.search(r"\d+", arch)
+        if not gen or int(gen.group()) < (18 if arch.endswith("p") else 17):
+            self.skipTest("NAX is not available")
+        mlx_dir = os.path.dirname(mx.__file__)
+        paths = [
+            os.path.join(mlx_dir, "lib", "mlx.metallib"),
+            os.path.join(mlx_dir, "mlx.metallib"),
+        ]
+        paths = [p for p in paths if os.path.exists(p)]
+        if not paths:
+            self.skipTest("mlx.metallib not found (JIT build?)")
+        with open(paths[0], "rb") as f:
+            metallib = f.read()
+
+        def name(dtype, group_size, bits, bm, aligned, batched):
+            return (
+                f"affine_qmm_t_nax_{dtype}_gs_{group_size}_b_{bits}"
+                f"_bm{bm}_bn64_bk{bm}_wm2_wn2_alN_{aligned}_batch_{batched}"
+            ).encode()
+
+        missing = [
+            name(dtype, group_size, bits, 128, aligned, batched).decode()
+            for dtype, group_size, bits, aligned, batched in product(
+                ["float16_t", "bfloat16_t"],
+                [32, 64, 128],
+                [1, 2, 3, 4, 5, 6, 8],
+                ["true", "false"],
+                [0, 1],
+            )
+            if name(dtype, group_size, bits, 128, aligned, batched) not in metallib
+        ]
+        self.assertFalse(
+            missing,
+            f"{len(missing)} large-M kernels not in the metallib: {missing[:1]}",
+        )
+        # sanity check of the name format, and no float32 kernel for the tile
+        self.assertTrue(name("bfloat16_t", 64, 4, 64, "true", 0) in metallib)
+        self.assertFalse(name("float", 64, 4, 128, "true", 0) in metallib)
+
+    @unittest.skipIf(not mx.is_available(mx.gpu), "GPU kernel path only")
+    def test_qmm_large_m_matches_small_m(self):
+        # A row of the output depends only on the same row of x, and the large
+        # tile accumulates over K in the same order as the default tile, so the
+        # rows of a large-M product have to be bit-identical to the same rows
+        # computed with M = 64, which always uses the default tile. Batched
+        # weights (B > 1) keep both products on the plain qmm kernel.
+        key = mx.random.key(0)
+        k1, k2 = mx.random.split(key)
+        tests = product(
+            [mx.float16, mx.bfloat16],  # dtype
+            [32, 64, 128],  # group_size
+            [1, 2, 3, 4, 5, 6, 8],  # bits
+            [65, 127, 129, 192, 2049],  # M (65: first M past the M = 64 boundary)
+            [192, 200],  # N
+            [128, 512, 1024],  # K (128: a single K iteration, default tile)
+        )
+        for dtype, group_size, bits, M, N, K in tests:
+            if bits == 1 and mx.cuda.is_available():
+                continue
+            with self.subTest(
+                dtype=dtype, shape=(M, N, K), group_size=group_size, bits=bits
+            ):
+                x = (mx.random.normal(shape=(2, M, K), key=k1) / K**0.5).astype(dtype)
+                w = (mx.random.normal(shape=(2, N, K), key=k2) / K**0.5).astype(dtype)
+                wq = mx.quantize(w, group_size, bits)
+
+                def qmm(x):
+                    return mx.quantized_matmul(
+                        x, *wq, transpose=True, group_size=group_size, bits=bits
+                    )
+
+                y = qmm(x)
+                # first and last 64 rows: the last block overlaps the partial
+                # M tile of the large product
+                self.assertTrue(mx.array_equal(y[:, :64], qmm(x[:, :64])))
+                self.assertTrue(mx.array_equal(y[:, M - 64 :], qmm(x[:, M - 64 :])))
+
+    @unittest.skipIf(not mx.is_available(mx.gpu), "GPU kernel path only")
+    def test_qmm_large_m_other_routes(self):
+        # Large M with float32, K % 128 != 0, K < 512, non-affine modes and gather_qmm
+        # keep the default tile. The rows have to match the M = 64 products.
+        key = mx.random.key(0)
+        k1, k2 = mx.random.split(key)
+        M, N = 200, 192
+
+        def check(x, wq, **kwargs):
+            def qmm(x):
+                return mx.quantized_matmul(x, *wq, transpose=True, **kwargs)
+
+            y = qmm(x)
+            self.assertTrue(mx.array_equal(y[:, :64], qmm(x[:, :64])))
+            self.assertTrue(mx.array_equal(y[:, M - 64 :], qmm(x[:, M - 64 :])))
+
+        # float32 (K = 512), K % 128 != 0 (K = 192) and K < 512 (K = 128)
+        for dtype, K in [(mx.float32, 512), (mx.float16, 192), (mx.float16, 128)]:
+            with self.subTest(dtype=dtype, K=K):
+                x = (mx.random.normal(shape=(2, M, K), key=k1) / K**0.5).astype(dtype)
+                w = (mx.random.normal(shape=(2, N, K), key=k2) / K**0.5).astype(dtype)
+                check(x, mx.quantize(w, 64, 4), group_size=64, bits=4)
+
+        for mode in ["mxfp4", "nvfp4", "mxfp8"]:
+            with self.subTest(mode=mode):
+                K = 512
+                x = (mx.random.normal(shape=(2, M, K), key=k1) / K**0.5).astype(
+                    mx.bfloat16
+                )
+                w = (mx.random.normal(shape=(2, N, K), key=k2) / K**0.5).astype(
+                    mx.bfloat16
+                )
+                wq = mx.quantize(w, mode=mode)
+                check(x, wq, mode=mode)
+                w_hat = mx.dequantize(*wq, mode=mode)
+                y = mx.quantized_matmul(x, *wq, transpose=True, mode=mode)
+                y_hat = x.astype(mx.float32) @ w_hat.astype(mx.float32).swapaxes(-1, -2)
+                self.assertLess((y.astype(mx.float32) - y_hat).abs().max(), 3e-2)
+
+        # gather_qmm uses the BK = 64 tile only. Its results have to be
+        # identical to the quantized matmul (large tile) of the gathered
+        # operands.
+        K = 512
+        for group_size, bits in [(32, 4), (64, 1), (128, 8)]:
+            with self.subTest(gather=True, group_size=group_size, bits=bits):
+                x = (mx.random.normal(shape=(3, M, K), key=k1) / K**0.5).astype(
+                    mx.bfloat16
+                )
+                w = (mx.random.normal(shape=(4, N, K), key=k2) / K**0.5).astype(
+                    mx.bfloat16
+                )
+                wq = mx.quantize(w, group_size, bits)
+                lhs = mx.array([2, 0, 1, 1], dtype=mx.uint32)
+                rhs = mx.array([1, 3, 0, 2], dtype=mx.uint32)
+                y = mx.gather_qmm(
+                    x, *wq, lhs, rhs, transpose=True, group_size=group_size, bits=bits
+                )
+                y_ref = mx.quantized_matmul(
+                    x[lhs],
+                    *(a[rhs] for a in wq),
+                    transpose=True,
+                    group_size=group_size,
+                    bits=bits,
+                )
+                self.assertTrue(mx.array_equal(y, y_ref))
 
     @unittest.skipIf("CI" in os.environ, "too slow in CI")
     def test_qmm_non_transposed(self):
