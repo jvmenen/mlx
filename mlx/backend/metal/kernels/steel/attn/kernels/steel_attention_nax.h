@@ -18,6 +18,7 @@ constant bool has_mask [[function_constant(300)]];
 constant bool do_causal [[function_constant(301)]];
 constant bool has_sinks [[function_constant(302)]];
 constant bool save_lse [[function_constant(303)]];
+constant bool output_f32 [[function_constant(304)]];
 
 template <typename T>
 struct TransformScale {
@@ -115,9 +116,14 @@ template <
   V += tidl.z * params->V_strides[0] + // Batch
       kv_head_idx * params->V_strides[1]; // Head
 
-  O += tidl.z * params->O_strides[0] + // Batch
+  // With output_f32 the output buffer holds float32 elements; O32 addresses
+  // it with the same element offsets as O.
+  device float* O32 = reinterpret_cast<device float*>(O);
+  const ulong o_offset = tidl.z * params->O_strides[0] + // Batch
       tidl.y * params->O_strides[1] + // Head
       tidl.x * BQ * params->O_strides[2]; // Sequence
+  O += o_offset;
+  O32 += o_offset;
 
   if (save_lse) {
     // [B, H, qL], contiguous.
@@ -496,14 +502,23 @@ template <
 
   // Store results
   O += tm * int(params->O_strides[2]);
+  O32 += tm * int(params->O_strides[2]);
 
   if (!align_Q && is_last_q) {
     if (lim_rows_q <= 0)
       return;
 
-    Otile.store_rows(O, int(params->O_strides[2]), lim_rows_q);
+    if (output_f32) {
+      Otile.store_rows(O32, int(params->O_strides[2]), lim_rows_q);
+    } else {
+      Otile.store_rows(O, int(params->O_strides[2]), lim_rows_q);
+    }
   } else {
-    Otile.store(O, int(params->O_strides[2]));
+    if (output_f32) {
+      Otile.store(O32, int(params->O_strides[2]));
+    } else {
+      Otile.store(O, int(params->O_strides[2]));
+    }
   }
 }
 
@@ -558,9 +573,14 @@ template <
   V += tidl.z * params->V_strides[0] + // Batch
       kv_head_idx * params->V_strides[1]; // Head
 
-  O += tidl.z * params->O_strides[0] + // Batch
+  // With output_f32 the output buffer holds float32 elements; O32 addresses
+  // it with the same element offsets as O.
+  device float* O32 = reinterpret_cast<device float*>(O);
+  const ulong o_offset = tidl.z * params->O_strides[0] + // Batch
       tidl.y * params->O_strides[1] + // Head
       tidl.x * BQ * params->O_strides[2]; // Sequence
+  O += o_offset;
+  O32 += o_offset;
 
   if (has_mask) {
     mask += tidl.z * mask_params->M_strides[0] + // Batch
@@ -611,6 +631,7 @@ template <
   K += d_group * BDh;
   V += d_group * BDh;
   O += tm * int(params->O_strides[2]) + d_group * BDh;
+  O32 += tm * int(params->O_strides[2]) + d_group * BDh;
 
   constexpr short kRowsPT = otile_t::kRowsPerThread;
 
@@ -943,8 +964,16 @@ template <
   if (!align_Q && is_last_q) {
     if (lim_rows_q <= 0)
       return;
-    Otile.store_rows(O, int(params->O_strides[2]), lim_rows_q);
+    if (output_f32) {
+      Otile.store_rows(O32, int(params->O_strides[2]), lim_rows_q);
+    } else {
+      Otile.store_rows(O, int(params->O_strides[2]), lim_rows_q);
+    }
   } else {
-    Otile.store(O, int(params->O_strides[2]));
+    if (output_f32) {
+      Otile.store(O32, int(params->O_strides[2]));
+    } else {
+      Otile.store(O, int(params->O_strides[2]));
+    }
   }
 }

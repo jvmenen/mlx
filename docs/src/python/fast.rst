@@ -13,6 +13,7 @@ Fast
   cross_entropy
   rope
   scaled_dot_product_attention
+  scaled_dot_product_attention_with_lse
   metal_kernel
   cuda_kernel
   precompiled_cuda_kernel

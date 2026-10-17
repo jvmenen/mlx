@@ -267,6 +267,9 @@ void sdpa_full_self_attention_nax(
   const bool do_causal = do_causal_;
   const bool has_sinks = sinks.has_value();
   const bool save_lse = (lse != nullptr);
+  // scaled_dot_product_attention_with_lse writes the output of half precision
+  // inputs in float32.
+  const bool output_f32 = o.dtype() == float32 && q.dtype() != float32;
 
   metal::MTLFCList func_consts = {
       {&align_Q, MTL::DataType::DataTypeBool, 200},
@@ -274,7 +277,8 @@ void sdpa_full_self_attention_nax(
       {&has_mask, MTL::DataType::DataTypeBool, 300},
       {&do_causal, MTL::DataType::DataTypeBool, 301},
       {&has_sinks, MTL::DataType::DataTypeBool, 302},
-      {&save_lse, MTL::DataType::DataTypeBool, 303}};
+      {&save_lse, MTL::DataType::DataTypeBool, 303},
+      {&output_f32, MTL::DataType::DataTypeBool, 304}};
 
   std::string base_name;
   concatenate(
@@ -311,7 +315,9 @@ void sdpa_full_self_attention_nax(
       "_has_sinks_",
       (has_sinks ? 't' : 'n'),
       "_save_lse_",
-      (save_lse ? 't' : 'n'));
+      (save_lse ? 't' : 'n'),
+      "_output_f32_",
+      (output_f32 ? 't' : 'n'));
 
   auto& compute_encoder = metal::get_command_encoder(s);
 
@@ -521,6 +527,9 @@ void sdpa_full_self_attention_metal(
   const bool do_causal = do_causal_;
   const bool has_sinks = sinks.has_value();
   const bool save_lse = (lse != nullptr);
+  // scaled_dot_product_attention_with_lse writes the output of half precision
+  // inputs in float32.
+  const bool output_f32 = o.dtype() == float32 && q.dtype() != float32;
 
   metal::MTLFCList func_consts = {
       {&align_Q, MTL::DataType::DataTypeBool, 200},
@@ -528,7 +537,8 @@ void sdpa_full_self_attention_metal(
       {&has_mask, MTL::DataType::DataTypeBool, 300},
       {&do_causal, MTL::DataType::DataTypeBool, 301},
       {&has_sinks, MTL::DataType::DataTypeBool, 302},
-      {&save_lse, MTL::DataType::DataTypeBool, 303}};
+      {&save_lse, MTL::DataType::DataTypeBool, 303},
+      {&output_f32, MTL::DataType::DataTypeBool, 304}};
 
   std::string base_name;
   concatenate(
@@ -565,7 +575,9 @@ void sdpa_full_self_attention_metal(
       "_has_sinks_",
       (has_sinks ? 't' : 'n'),
       "_save_lse_",
-      (save_lse ? 't' : 'n'));
+      (save_lse ? 't' : 'n'),
+      "_output_f32_",
+      (output_f32 ? 't' : 'n'));
 
   auto& compute_encoder = metal::get_command_encoder(s);
 
@@ -938,17 +950,28 @@ std::tuple<bool, std::string> has_fused_kernel(
     bool has_mask,
     bool has_arr_mask,
     bool do_causal,
+    bool is_training,
     bool output_logsumexp,
     Stream s) {
   if (s.device != Device::gpu) {
     return {false, "the fused kernels require a GPU (Metal) stream."};
   }
 
-  if (output_logsumexp && has_arr_mask) {
+  // The forward kernels support an array mask together with the logsumexp, the
+  // backward kernels that consume it do not.
+  if (output_logsumexp && is_training && has_arr_mask) {
     return {
         false,
         "the backward pass does not support an array mask; only causal masking "
         "is implemented."};
+  }
+
+  // Only the full attention kernels write the logsumexp.
+  if (output_logsumexp && q.shape(2) <= 8) {
+    return {
+        false,
+        "the vector attention kernels do not produce the logsumexp; it needs "
+        "a query length above 8."};
   }
 
   const int value_head_dim = v.shape(-1);
@@ -978,6 +1001,16 @@ std::tuple<bool, std::string> has_fused_kernel(
           << "query head dim " << query_head_dim << " and value head dim "
           << value_head_dim << ".";
       return {false, msg.str()};
+    }
+    // The float32 head dim 192 kernel needs 40448 bytes of threadgroup memory
+    // (Q tile plus K/V tile), above the 32768 byte limit, so it cannot load.
+    // The NAX kernels do not cover head dim 192.
+    if (query_head_dim == 192 && value_head_dim == 192 &&
+        q.dtype() == float32) {
+      return {
+          false,
+          "the full attention kernel for head dim 192 does not fit in "
+          "threadgroup memory for float32."};
     }
     if (has_mask && !has_arr_mask &&
         !(query_sequence_length <= key_sequence_length && do_causal)) {
@@ -1400,7 +1433,15 @@ bool ScaledDotProductAttention::use_fallback(
     bool force_fused,
     Stream s) {
   auto [has_fused, reason] = has_fused_kernel(
-      q, k, v, has_mask, has_arr_mask, do_causal, output_logsumexp, s);
+      q,
+      k,
+      v,
+      has_mask,
+      has_arr_mask,
+      do_causal,
+      is_training,
+      output_logsumexp,
+      s);
   if (force_fused) {
     if (!has_fused) {
       std::ostringstream msg;
