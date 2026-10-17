@@ -449,6 +449,66 @@ class TestFastSDPA(mlx_tests.MLXTestCase):
             )
             self.assertTrue(mx.allclose(ref, out, atol=1e-3, rtol=1e-3))
 
+    @unittest.skipIf(not mx.is_available(mx.gpu), "GPU kernel path only")
+    def test_sdpa_full_head_dim_256_array_mask(self):
+        # Boolean and additive array masks with head dim 256 and short to
+        # medium query chunks, with and without a long cached prefix. Whether
+        # these shapes take the fused or the unfused kernel depends on the
+        # device and the routing rules; the output must match the reference
+        # either way.
+        D = 256
+        Nq, Nkv = 8, 2
+        scale = D**-0.5
+        mx.random.seed(0)
+        cases = [
+            # (qL, kL)
+            (64, 64),
+            (64, 4096),
+            (256, 256),
+            (256, 8192),
+            (1023, 1023),
+            (1023, 20000),
+        ]
+        for dtype in (mx.float16, mx.bfloat16):
+            tol = 5e-3 if dtype == mx.bfloat16 else 1e-3
+            for qL, kL in cases:
+                q = (5e-1 * mx.random.normal(shape=(1, Nq, qL, D))).astype(dtype)
+                k = (5e-1 * mx.random.normal(shape=(1, Nkv, kL, D))).astype(dtype)
+                v = (5e-1 * mx.random.normal(shape=(1, Nkv, kL, D))).astype(dtype)
+
+                # Causal with a random subset of the earlier keys removed. The
+                # diagonal stays so that no row is fully masked.
+                q_idx = mx.arange(qL)[:, None] + (kL - qL)
+                k_idx = mx.arange(kL)[None]
+                keep = mx.random.uniform(shape=(qL, kL)) > 0.25
+                bool_mask = (q_idx >= k_idx) & (keep | (q_idx == k_idx))
+                add_mask = mx.where(bool_mask, 0.0, -1e4).astype(dtype)
+
+                masks = {
+                    "bool": bool_mask,
+                    "additive": add_mask,
+                    "bool_4d": bool_mask[None, None],
+                    "additive_4d": add_mask[None, None],
+                }
+                for name, mask in masks.items():
+                    with self.subTest(dtype=dtype, qL=qL, kL=kL, mask=name):
+                        ref = mlx_ref_attn(
+                            q.astype(mx.float32),
+                            k.astype(mx.float32),
+                            v.astype(mx.float32),
+                            scale=scale,
+                            mask=mask.astype(mx.float32)
+                            if mask.dtype != mx.bool_
+                            else mask,
+                        )
+                        out = mx.fast.scaled_dot_product_attention(
+                            q, k, v, scale=scale, mask=mask
+                        )
+                        self.assertEqual(out.shape, ref.shape)
+                        self.assertTrue(
+                            mx.allclose(out.astype(mx.float32), ref, atol=tol, rtol=tol)
+                        )
+
     @unittest.skipIf(not mx.metal.is_available(), "Metal kernel path only")
     def test_sdpa_head_dim_256_short_query_routing(self):
         if mx.default_device() != mx.gpu:
